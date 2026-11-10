@@ -95,6 +95,7 @@
 | 阿里云盘 `alipan.com/s/xxx` | ✅ 游客 | ⚠️ 需登录 | 匿名 `share_token` 可列目录；`get_download_url` 返回 `AccessTokenInvalid` |
 | 百度网盘 `pan.baidu.com/s/1xxx` | ⚠️ 需登录 | ✅ 登录后免转存直链 | `tplconfig → api/sharedownload`；游客 `errno=-6`（官方已关） |
 | 迅雷云盘 `pan.xunlei.com/s/xxx` | ✅ 游客可浏览全目录 | ⚠️ 下载需登录（转存后取链） | 9 层 md5 换 `X-Captcha-Token`，匿名可列目录，`web_content_link` 匿名为空 |
+| 城通网盘 `url95.ctfile.com/f/xxx` | ✅ 游客 | ✅ 游客 | ALTCHA-PBKDF2 人机验证本地可解（0.5s）；单连接限速 30KB/s，多连接实测 8 路 1.4MB/s |
 
 > **「需登录」是什么意思**：脚本在你已经登录的网盘页面里运行，用同源请求自动带上浏览器里的登录 Cookie —— 你不需要在弹出的面板里再输一次账号，也不会有任何账号信息离开你的浏览器。没登录时脚本会直接告诉你「请先在 xxx 登录」，不会假装成功。
 
@@ -212,6 +213,49 @@ MD5 是脚本内自带的实现（零依赖），已和 Node 的 `crypto` 逐条
 ```
 
 阿里接口的 CORS 对 `alipan.com` 完全开放（`allow-headers: content-type, x-share-token`），所以**手机浏览器也能列目录**，不需要油猴。
+
+### 城通网盘（单文件分享，游客可取链）
+
+```
+1. GET  /api/v2/captcha/altcha?captcha_action=share_passcode
+        → {parameters:{algorithm:"PBKDF2/SHA-256", cost, keyLength,
+                       keyPrefix, nonce, salt}, signature}
+2. 本地解 PoW（不是图形验证码）：
+        derivedKey = PBKDF2-HMAC-SHA256(
+            password   = hexToBytes(nonce) || uint32_be(counter),
+            salt       = hexToBytes(salt),
+            iterations = cost, dkLen = keyLength)
+        命中条件：hex(derivedKey).startsWith(keyPrefix)，counter 从 0 递增
+        → altcha_token = base64(JSON{challenge, solution:{counter, derivedKey, time}})
+3. GET  /api/v2/resource?kind=file&id=<fid>&folder_id=0&passcode=&type_id=0&altcha_token=
+        → data.file{file_name, file_size_bytes, file_id, userid, file_chk, verifycode}
+          data.access_pass
+4. POST /api/v2/download
+        {context:{kind,id,folder_id,fk,passcode,type_id,access_pass},
+         app:false, verifycode,
+         original_file:{file_id,userid,file_chk,start_time,wait_seconds}, carrier:0}
+        → data.downurl
+```
+
+五个坑，全踩过：
+
+- **`verifycode` / `file_chk` 必须原样带回**。它们是第 3 步那次响应里下发的、每次请求都不一样；漏掉就会收到 `403 Download signature is invalid`，看起来像「参数没传全」，其实是被当成签名不对。
+- **`altcha_token` 一次性**，同一个 token 用第二次直接 423。每次解析都要重新解一遍 PoW（实测 0.5s，64 路批量 `deriveBits`）。
+- **直链绑 IP**：`ctp=` 是请求方 IP 的十六进制（`111A229A174A181` = 111.229.174.181）。换网络/换设备重新取链。
+- **改参数会被拒**：把 `spd=30000` 改成 `spd=9999999` → `503`；删掉 `limit=2` → `400`。服务端认这两个值。
+- **单连接限速 30KB/s** 是写死的（`download_estimate.limit_speed_bytes`），但**限速是按连接算的**，多连接能叠加。
+
+加速实测（同一文件，805MB，`spd=30000`）：
+
+| 并发 | 实测总速度 | 倍数 |
+| --- | --- | --- |
+| 1 | 29.8 KB/s | 1× |
+| 4 | 407 KB/s | 13.6× |
+| 8 | 881 / 710 / 1555 KB/s（三轮） | 30–50× |
+
+越过 `threshold_bytes`（200MB）之后测 300MB 处的分片，速度不降，说明不是「前 200MB 高速」的套路。
+
+> **但城通有流量配额**：连续测了几 GB 之后，同一 IP 的所有 CDN 请求（含 Python 直连、换节点）统一返回 `503 Service Temporarily Unavailable`。所以脚本给城通设了 `maxThreads: 4`（既保留加速，又不容易撞限流），并且**不要拿它刷大文件**。
 
 ## 六、实测记录
 

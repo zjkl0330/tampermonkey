@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         云析直链 · 网盘直链下载助手
 // @namespace    https://github.com/CYQawa/YunX
-// @version      1.6.0
+// @version      1.7.0
 // @author       云析直链（YunX 移植）
-// @description  夸克 / UC / 123 / 115 / 天翼 / 移动 / 百度 / 迅雷 / 阿里 网盘分享直链解析，附分享页去广告：自动列目录、8 线程分片下载、暂停续传，可导出 IDM / Aria2 / cURL 命令。无口令、无授权码，装上即用。
+// @description  夸克 / UC / 123 / 115 / 天翼 / 移动 / 百度 / 迅雷 / 阿里 / 城通 网盘分享直链解析，附分享页去广告：自动列目录、8 线程分片下载、暂停续传，可导出 IDM / Aria2 / cURL 命令。无口令、无授权码，装上即用。
 // @license      AGPL-3.0-or-later
 // @homepage     https://github.com/CYQawa/YunX
 // @match        https://pan.quark.cn/*
@@ -21,6 +21,9 @@
 // @match        https://pan.baidu.com/*
 // @match        https://yun.baidu.com/*
 // @match        https://pan.xunlei.com/*
+// @match        https://*.ctfile.com/*
+// @match        https://ctfile.com/*
+// @match        https://*.545c.com/*
 // @match        https://www.alipan.com/*
 // @match        https://www.aliyundrive.com/*
 // @connect      115.com
@@ -53,7 +56,7 @@
    * 0. 常量
    * ===================================================================== */
 
-  const APP = { name: '云析直链', version: '1.6.0' };
+  const APP = { name: '云析直链', version: '1.7.0' };
 
   // 夸克 PC 客户端 UA：列表 / 取链接口都校验它
   const UA_QUARK =
@@ -1979,7 +1982,201 @@
     }
   };
 
-  const PLATFORMS = [quark, uc, pan123, p115, tianyi, c139, baidu, xunlei, aliyun];
+  /* ---------------- 城通网盘 ---------------- */
+
+  const CT_API = 'https://urlapi.ctfile.com';
+
+  function ctHeaders() {
+    return {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Origin': 'https://www.ctfile.com',
+      'Referer': 'https://www.ctfile.com/',
+      'Accept': 'application/json, text/plain, */*'
+    };
+  }
+
+  const ctHex = {
+    toBytes(h) {
+      const s = String(h || '');
+      const a = new Uint8Array(s.length >> 1);
+      for (let i = 0; i < a.length; i++) a[i] = parseInt(s.substr(i * 2, 2), 16);
+      return a;
+    },
+    from(b) {
+      let s = '';
+      for (let i = 0; i < b.length; i++) s += (b[i] < 16 ? '0' : '') + b[i].toString(16);
+      return s;
+    }
+  };
+
+  /**
+   * 城通的人机验证是 ALTCHA 的 PBKDF2 变体（不是图形验证码）：
+   *   derivedKey = PBKDF2-HMAC-SHA256(
+   *       password = hexToBytes(nonce) || uint32_be(counter),
+   *       salt     = hexToBytes(salt),
+   *       iterations = cost, dkLen = keyLength)
+   *   命中条件：hex(derivedKey).startsWith(keyPrefix)
+   * counter 从 0 递增。实测 2779 次命中、耗时约 0.5s（批量并发 deriveBits）。
+   * 已用 Python 独立复现，result 与浏览器 solution 逐字节一致。
+   */
+  async function ctSolveAltcha(challenge) {
+    const p = (challenge && challenge.parameters) || {};
+    if (String(p.algorithm || '').indexOf('PBKDF2/') !== 0) {
+      throw new Error('城通验证算法已变更（' + (p.algorithm || '未知') + '），需要更新脚本');
+    }
+    if (!(self.crypto && crypto.subtle)) {
+      throw new Error('当前环境不支持 WebCrypto，城通验证无法完成（请用 https 页面）');
+    }
+    const nonce = ctHex.toBytes(p.nonce);
+    const salt = ctHex.toBytes(p.salt);
+    const prefix = String(p.keyPrefix || '').toLowerCase();
+    const cost = Number(p.cost) || 1200;
+    const klen = Number(p.keyLength) || 32;
+    if (!prefix) throw new Error('城通验证参数缺失');
+
+    const t0 = Date.now();
+    const BATCH = 64;
+    const LIMIT = 400000;
+    for (let base = 0; base < LIMIT; base += BATCH) {
+      const jobs = [];
+      for (let i = 0; i < BATCH; i++) {
+        const c = base + i;
+        const pwd = new Uint8Array(nonce.length + 4);
+        pwd.set(nonce, 0);
+        new DataView(pwd.buffer).setUint32(nonce.length, c, false);
+        jobs.push((async () => {
+          const key = await crypto.subtle.importKey('raw', pwd, { name: 'PBKDF2' }, false, ['deriveBits']);
+          const bits = await crypto.subtle.deriveBits(
+            { name: 'PBKDF2', salt: salt, iterations: cost, hash: 'SHA-256' }, key, klen * 8
+          );
+          return [c, ctHex.from(new Uint8Array(bits))];
+        })());
+      }
+      const rs = await Promise.all(jobs);
+      for (let i = 0; i < rs.length; i++) {
+        if (rs[i][1].indexOf(prefix) === 0) {
+          return { counter: rs[i][0], derivedKey: rs[i][1], time: Date.now() - t0 };
+        }
+      }
+    }
+    throw new Error('城通验证超时（已尝试 40 万次），请重试');
+  }
+
+  const ctfile = {
+    id: 'ctfile',
+    name: '城通网盘',
+    color: '#1a8fe3',
+    logo: '城通',
+    hosts: ['www.ctfile.com', 'url95.ctfile.com'],
+    cookieUrl: 'https://www.ctfile.com',
+    guestLabel: '游客',
+    guestHint: '游客可取链，免费通道限速 30KB/s（脚本多连接加速）',
+    maxThreads: 4,          // 城通 CDN 对单 IP 有并发/流量限制，实测 4 路最稳（8 路易 503）
+
+    pick(url) {
+      const m = String(url).match(/(?:ctfile\.com|ctfile\.net|545c\.com)\/(f|file|d)\/([0-9]+-[0-9]+(?:-[0-9a-f]+)?)/i);
+      if (!m) return null;
+      const pwd = (String(url).match(/[?&](?:p|passcode|pwd)=([A-Za-z0-9]+)/) || [])[1] || '';
+      return { id: m[2], pwd };
+    },
+
+    async init(ctx) {
+      // 1. 取 ALTCHA challenge（每次解析都要新的，token 一次性）
+      const cr = await gmRequest({
+        url: `${CT_API}/api/v2/captcha/altcha?captcha_action=share_passcode`,
+        headers: ctHeaders()
+      });
+      const cj = parseJSON(cr, '获取城通验证失败');
+      if (!cj || !cj.parameters) throw new Error('城通验证接口返回异常');
+
+      // 2. 本地解 PoW
+      const sol = await ctSolveAltcha(cj);
+      ctx.altchaToken = bytesToB64(new TextEncoder().encode(JSON.stringify({ challenge: cj, solution: sol })));
+
+      // 3. 用 token 换文件信息
+      const qs = new URLSearchParams({
+        kind: 'file', id: ctx.id, folder_id: '0', fk: '',
+        passcode: ctx.pwd || '', type_id: '0', altcha_token: ctx.altchaToken
+      });
+      const res = await gmRequest({ url: `${CT_API}/api/v2/resource?${qs.toString()}`, headers: ctHeaders() });
+      const j = parseJSON(res, '获取城通文件信息失败');
+      const code = Number(j.code);
+      if (code !== 200) {
+        const msg = String(j.msg || '');
+        if (code === 423 && /passcode/i.test(msg)) {
+          throw new Error(ctx.pwd ? '提取码不正确，请检查后重试' : '该分享需要提取码，请在链接后加 ?p=xxxx 再试');
+        }
+        if (code === 423) throw new Error('城通人机验证未通过，请重试');
+        if (code === 404) throw new Error('文件不存在或已被删除');
+        throw new Error(msg || `城通返回错误（${code}）`);
+      }
+      const d = j.data || {};
+      const f = d.file || {};
+      ctx.file = f;
+      ctx.accessPass = d.access_pass || '';
+      ctx.title = f.file_name || '';
+      ctx.logged = false;
+    },
+
+    async list(ctx) {
+      const f = ctx.file || {};
+      if (!f.file_id) throw new Error('没有读到文件信息');
+      return [{
+        fid: String(ctx.id),
+        name: f.file_name || '未命名',
+        size: Number(f.file_size_bytes || 0),
+        dir: false,
+        token: ''
+      }];
+    },
+
+    async link(ctx, file) {
+      const f = ctx.file || {};
+      // verifycode / file_chk 是 resource 那一次响应里下发的，会随请求变化，
+      // 必须原样带回来，否则服务端报 "Download signature is invalid"
+      const body = {
+        context: {
+          kind: 'file', id: ctx.id, folder_id: '0', fk: '',
+          passcode: ctx.pwd || '', type_id: '0', access_pass: ctx.accessPass || ''
+        },
+        app: false,
+        verifycode: f.verifycode || '',
+        original_file: {
+          file_id: f.file_id,
+          userid: f.userid,
+          file_chk: f.file_chk || '',
+          start_time: f.start_time,
+          wait_seconds: f.wait_seconds
+        },
+        carrier: 0
+      };
+      const headers = ctHeaders();
+      headers['Content-Type'] = 'application/json;charset=UTF-8';
+      const res = await gmRequest({
+        method: 'POST',
+        url: `${CT_API}/api/v2/download`,
+        headers,
+        data: JSON.stringify(body)
+      });
+      const j = parseJSON(res, '城通取链失败');
+      if (Number(j.code) !== 200) {
+        if (Number(j.code) === 423) throw new Error('城通验证已过期，请重新解析');
+        throw new Error(j.msg || '城通取链失败');
+      }
+      const d = j.data || {};
+      if (!d.downurl) throw new Error('城通未返回直链');
+      return {
+        url: d.downurl,
+        headers: { 'Referer': 'https://url95.ctfile.com/' },
+        guest: true,
+        filename: d.file_name || file.name,
+        size: Number(d.file_size || file.size || 0),
+        note: '免费通道单连接限速 30KB/s，脚本按多连接分片下载；直链绑定你的 IP，勿外传'
+      };
+    }
+  };
+
+  const PLATFORMS = [quark, uc, pan123, p115, tianyi, c139, baidu, xunlei, aliyun, ctfile];
 
   function detectPlatform(url) {
     for (const p of PLATFORMS) {
@@ -2039,6 +2236,12 @@
       return;
     }
     const picked = platform.pick(url);
+    if (!picked) {
+      state.error = '这个页面不是分享页，请打开具体的分享链接';
+      state.loading = false;
+      render();
+      return;
+    }
     if (platform.needGM && !HAS_GM_XHR && !preferPageFetch('https://' + platform.hosts[0] + '/')) {
       state.error = `${platform.name} 需要电脑端油猴环境（要自定义 UA 与 Referer），手机浏览器直连取不到直链`;
       state.loading = false;
@@ -2473,7 +2676,9 @@
       task.size = probe.total;
 
       try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch (e) { /* ignore */ }
-      const threads = Math.max(1, Math.min(16, Number(settings.threads) || 8));
+      // 部分平台的 CDN 对「同一会话并发连接数」有硬上限（城通 limit=2，超了直接 503）
+      const cap = Math.max(1, Math.min(16, Number((state.platform && state.platform.maxThreads) || 16)));
+      const threads = Math.max(1, Math.min(cap, Number(settings.threads) || 8));
       const p = this.plan(task.size, threads);
       task.chunkSize = p.chunk;
       task.chunks = p.chunks;
@@ -3691,7 +3896,7 @@
 
   function preloadFor(url) {
     const plat = detectPlatform(url);
-    if (!plat) return;
+    if (!plat || !plat.pick(url)) return;
     if (!settings.autoParse) return;
     if (state.ctx && state.shareUrl === url) return;
     parseShare(url).then(() => {
@@ -3713,11 +3918,11 @@
    * 这里在这些按钮旁边挂一个「⚡直链」，点一下就是脚本的下载面板。
    * ===================================================================== */
 
-  const HOOK_RE = /^(保存到网盘|存到网盘|下载|立即下载|下载到本地|打开\s*APP|用\s*APP\s*打开|APP\s*内打开)$/i;
+  const HOOK_RE = /^(保存到网盘|存到网盘|下载|立即下载|普通下载|高速下载|下载到本地|打开\s*APP|用\s*APP\s*打开|APP\s*内打开)$/i;
 
   function hookPageButtons() {
     if (!settings.hookButtons) return;
-    if (!/\/s\//.test(location.pathname)) return;
+    if (!detectPlatform(location.href)) return;
 
     const scan = () => {
       // 全页面只挂一个，避免手机窄屏被挤出屏幕
@@ -3821,7 +4026,7 @@
     } catch (e) { /* ignore */ }
 
     // 只在分享页自动预解析
-    if (/\/s\//.test(location.pathname)) preloadFor(location.href);
+    if (detectPlatform(location.href)) preloadFor(location.href);
 
     window.addEventListener('beforeunload', () => DL.save());
 
@@ -3830,7 +4035,7 @@
     setInterval(() => {
       if (location.href === lastHref) return;
       lastHref = location.href;
-      if (/\/s\//.test(location.pathname)) {
+      if (detectPlatform(location.href)) {
         resetShare();
         preloadFor(location.href);
         hookPageButtons();
