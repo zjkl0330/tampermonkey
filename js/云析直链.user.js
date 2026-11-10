@@ -4323,9 +4323,19 @@
 
   function baiduAuthPage() {
     const href = location.href;
+    // 只处理本脚本发起的授权：client_id 必须在白名单里（或 10 分钟内有本脚本发起的授权）。
+    // 否则用户在授权别的应用时会被我们“帮”着点同意 —— 那是越权。
+    const cid = (() => {
+      try { return new URL(href).searchParams.get('client_id') || ''; } catch (e) { return ''; }
+    })();
+    const pendingAt = Number(GMStore.get('yx_baidu_auth_pending', 0) || 0);
+    const ours = BAIDU_CLIENTS.indexOf(cid) >= 0 ||
+      (pendingAt > 0 && Date.now() - pendingAt < 10 * 60 * 1000);
+    if (!ours) return;
 
     // ① 授权确认页：自动点「允许」，省掉用户找按钮
     if (/\/oauth\/2\.0\/authorize/.test(href)) {
+      if (cid) GMStore.set('yx_baidu_auth_pending', Date.now());
       const onLoginBox = !!document.querySelector('#TANGRAM_3__submit, .pass-form');
       yxAuthBanner(
         onLoginBox
@@ -4353,7 +4363,7 @@
     }
 
     // ② 授权成功页：地址栏里带 access_token
-    if (/login_success|\/oauth\/2\.0\/(?!authorize)/.test(href)) {
+    if (/login_success/.test(href)) {
       let saved = false;
       const grab = () => {
         if (saved) return true;
