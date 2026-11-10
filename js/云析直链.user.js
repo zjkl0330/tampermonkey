@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         云析直链 · 网盘直链下载助手
 // @namespace    https://github.com/CYQawa/YunX
-// @version      1.7.0
+// @version      1.8.0
 // @author       云析直链（YunX 移植）
 // @description  夸克 / UC / 123 / 115 / 天翼 / 移动 / 百度 / 迅雷 / 阿里 / 城通 网盘分享直链解析，附分享页去广告：自动列目录、8 线程分片下载、暂停续传，可导出 IDM / Aria2 / cURL 命令。无口令、无授权码，装上即用。
 // @license      AGPL-3.0-or-later
@@ -20,6 +20,7 @@
 // @match        https://caiyun.139.com/*
 // @match        https://pan.baidu.com/*
 // @match        https://yun.baidu.com/*
+// @match        https://openapi.baidu.com/*
 // @match        https://pan.xunlei.com/*
 // @match        https://*.ctfile.com/*
 // @match        https://ctfile.com/*
@@ -44,6 +45,7 @@
 // @grant        GM_setValue
 // @grant        GM_cookie
 // @grant        GM_registerMenuCommand
+// @grant        GM_openInTab
 // @grant        unsafeWindow
 // @run-at       document-idle
 // @noframes
@@ -56,7 +58,7 @@
    * 0. 常量
    * ===================================================================== */
 
-  const APP = { name: '云析直链', version: '1.7.0' };
+  const APP = { name: '云析直链', version: '1.8.0' };
 
   // 夸克 PC 客户端 UA：列表 / 取链接口都校验它
   const UA_QUARK =
@@ -293,7 +295,9 @@
     //   - 迅雷接口与分享页同站且放行 CORS
     // 其余平台（夸克 / 123 / 115…）强校验自定义 UA，必须用 GM_xmlhttpRequest，
     // 不能因为「同源」就切成 fetch，否则会丢掉 UA 直接 403。
-    if (preferPageFetch(opt.url)) return fetchRequest(opt);
+    // opt.forceGM：百度 xpan 开放接口与 dlink 必须带 UA「pan.baidu.com」，
+    // fetch 改不了 UA，只能强制走 GM 通道。
+    if (!opt.forceGM && preferPageFetch(opt.url)) return fetchRequest(opt);
     if (HAS_GM_XHR) return GM_xmlhttpRequest(opt);
     return fetchRequest(opt);
   }
@@ -349,6 +353,7 @@
           url: opt.url,
           headers: opt.headers || {},
           data: opt.data,
+          forceGM: opt.forceGM,
           timeout: opt.timeout === 0 ? 0 : (opt.timeout || 25000),
           responseType: opt.responseType || 'text',
           onload: (r) => done(resolve, r),
@@ -1268,7 +1273,22 @@
   const BAIDU_UA_WEB =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
   const BAIDU_UA_NETDISK = 'netdisk;12.24.6;piano;android-android;16;JSbridge4.4.0;jointBridge;1.1.0';
+  // 下载 dlink 时的强制 UA。百度开放平台文档原文：
+  //   「User-Agent: pan.baidu.com  必填」；UA 不对会命中防盗链（31326 / 403），
+  //   文件超过 50MB 时尤其明显。这个 UA 只能靠 GM_xmlhttpRequest 设置。
+  const BAIDU_DL_UA = 'pan.baidu.com';
   const BAIDU_TMP_DIR = '/yunx';
+  // 授权用的公开 client_id（都是开源项目/官方测试端在用的，可长期使用）。
+  // 第一个不通时自动顺延下一个。
+  const BAIDU_CLIENTS = [
+    'omiOnr2tYnN9vSyDErcVFWpPU2mZA7YO', // OpenList
+    'iYCeC9g08h5vuP9UqvPHKKSVrKFXGa1v', // Alist
+    'L6g70tBRRIXLsY0Z3HwKqlRE'          // pcstest_oauth（百度官方 PC 测试端）
+  ];
+  const BAIDU_TOKEN_KEY = 'baidu_access_token';
+  const baiduAuthURL = (cid) =>
+    'https://openapi.baidu.com/oauth/2.0/authorize?response_type=token&scope=basic,netdisk' +
+    `&client_id=${cid}&redirect_uri=oob&confirm_login=0`;
 
   const baidu = {
     id: 'baidu',
@@ -1323,8 +1343,176 @@
       return h;
     },
 
+    /* ---------------- 授权（AccessToken 通道） ----------------
+     * 百度 2023 年起关闭游客取链，2025 年起前端普遍改走开放平台 OAuth。
+     * 好处：一次授权拿到 access_token（30 天有效），之后完全不依赖
+     * BDUSS / bdstoken / 页面改版，取链和下载都只认这个 token。
+     */
+    token() {
+      const t = GMStore.get(BAIDU_TOKEN_KEY, '') || '';
+      return typeof t === 'string' ? t.trim() : '';
+    },
+
+    hasToken() {
+      return !!this.token();
+    },
+
+    /**
+     * 打开授权页 → 授权页由本脚本自动点「允许」→ token 写回存储。
+     * 授权页逻辑见文件末尾 baiduAuthPage()。
+     */
+    async authorize() {
+      const existing = this.token();
+      if (existing) return existing;
+      let url = '';
+      for (const cid of BAIDU_CLIENTS) {
+        url = baiduAuthURL(cid);
+        // 逐个试：某个 client_id 被封时，授权页会报错而不是给出「允许」按钮，
+        // 超时后顺延下一个（最多 25 秒）。
+        const ok = await this._openAuthAndWait(url);
+        if (ok) return ok;
+      }
+      throw new Error(
+        '百度授权未完成。请确认：1) 已在本浏览器登录百度账号；2) 授权页弹出后点击「允许」。' +
+          '若一直没反应，可在脚本菜单里先用「打开直链面板」登录后再试。'
+      );
+    },
+
+    _openAuthAndWait(url) {
+      return new Promise((resolve) => {
+        let opened = null;
+        try {
+          if (typeof GM_openInTab === 'function') {
+            opened = GM_openInTab(url, { active: true, insert: true, setParent: true });
+          }
+        } catch (e) { opened = null; }
+        if (!opened) {
+          try { window.open(url, '_blank', 'noopener'); } catch (e) { /* ignore */ }
+        }
+        let n = 0;
+        const iv = setInterval(() => {
+          n++;
+          const t = this.token();
+          if (t) { clearInterval(iv); resolve(t); return; }
+          // 2 分钟还没授权成功就放弃，交给上层换 client_id / 报错
+          if (n > 60) { clearInterval(iv); resolve(''); }
+        }, 2000);
+      });
+    },
+
+    // 统一 xpan 开放接口请求：必须带 UA pan.baidu.com，且强制 GM 通道
+    async _xpan(url) {
+      const res = await gmRequest({
+        url,
+        forceGM: true,
+        headers: { 'User-Agent': BAIDU_DL_UA, 'Referer': 'https://pan.baidu.com/' }
+      });
+      return parseJSON(res, '百度开放接口异常');
+    },
+
+    // 校验令牌是否可用（顺便拿到账号名做反馈）
+    async verifyToken() {
+      const token = this.token();
+      if (!token) return null;
+      try {
+        const j = await this._xpan(
+          'https://pan.baidu.com/rest/2.0/xpan/nas?method=uinfo' +
+            `&access_token=${encodeURIComponent(token)}`
+        );
+        if (Number(j.errno) === 0) return j;
+        if (Number(j.errno) === 31045 || Number(j.errno) === -6) {
+          GMStore.set(BAIDU_TOKEN_KEY, '');
+        }
+        return null;
+      } catch (e) { return null; }
+    },
+
+    // dlink 必须追加 access_token 才能下载（百度文档硬性要求，不是 Header）
+    _attachToken(dlink, token) {
+      if (!dlink || !/^http/i.test(dlink)) return '';
+      if (/[?&]access_token=/.test(dlink)) return dlink;
+      const t = token || this.token();
+      if (!t) return dlink;
+      return dlink + (dlink.indexOf('?') >= 0 ? '&' : '?') + 'access_token=' + encodeURIComponent(t);
+    },
+
+    // 用 token 取 dlink（自己网盘里的文件 / 转存后的文件都走这里）
+    async _dlinkByToken(fsid) {
+      const token = this.token();
+      if (!token) return '';
+      const url =
+        'https://pan.baidu.com/rest/2.0/xpan/multimedia?method=filemetas&dlink=1' +
+        `&fsids=%5B${encodeURIComponent(String(fsid))}%5D` +
+        `&access_token=${encodeURIComponent(token)}`;
+      const j = await this._xpan(url);
+      if (Number(j.errno) === 31045 || Number(j.errno) === -6) {
+        // token 失效：清掉，让上层引导重新授权
+        GMStore.set(BAIDU_TOKEN_KEY, '');
+        throw new Error('百度访问令牌已过期，已自动清除，请点「授权百度」重新授权');
+      }
+      if (Number(j.errno) !== 0) {
+        throw new Error(j.errmsg || `百度取链失败（errno ${j.errno}）`);
+      }
+      const it = (j.list || [])[0];
+      if (!it || !it.dlink) throw new Error('百度未返回 dlink（文件可能已被删除或无权访问）');
+      return this._attachToken(it.dlink, token);
+    },
+
+    // 用 token 列出自己网盘目录（转存后回读用）
+    async _listByToken(dir) {
+      const token = this.token();
+      if (!token) throw new Error('缺少百度访问令牌');
+      const url =
+        'https://pan.baidu.com/rest/2.0/xpan/file?method=list&showempty=1' +
+        `&dir=${encodeURIComponent(dir)}&access_token=${encodeURIComponent(token)}`;
+      const j = await this._xpan(url);
+      if (Number(j.errno) === 31045) {
+        GMStore.set(BAIDU_TOKEN_KEY, '');
+        throw new Error('百度访问令牌已过期，请重新授权');
+      }
+      return j;
+    },
+
+    // 用 token 转存分享文件（比网页版 /share/transfer 稳定，不吃 bdstoken）
+    async _transferByToken(ctx, file) {
+      const token = this.token();
+      if (!token) throw new Error('缺少百度访问令牌');
+      if (!ctx.shareId || !ctx.shareUk) throw new Error('分享信息不完整（shareid / uk 缺失）');
+      const q = new URLSearchParams({
+        method: 'transfer',
+        access_token: token,
+        shareid: String(ctx.shareId),
+        from: String(ctx.shareUk),
+        sekey: ctx.sekey || '',
+        ondup: 'newcopy',
+        async: '0'
+      });
+      const body = new URLSearchParams({
+        fsidlist: JSON.stringify([Number(file.fid)]),
+        path: BAIDU_TMP_DIR
+      });
+      const res = await gmRequest({
+        method: 'POST',
+        url: `https://pan.baidu.com/rest/2.0/xpan/share?${q.toString()}`,
+        forceGM: true,
+        headers: {
+          'User-Agent': BAIDU_DL_UA,
+          'Referer': `https://pan.baidu.com/s/${ctx.id}`,
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        data: body.toString()
+      });
+      const j = parseJSON(res, '转存失败');
+      if (Number(j.errno) !== 0) {
+        throw new Error(j.show_msg || j.errmsg || `转存失败（errno ${j.errno}）`);
+      }
+      const list = j.list || j.extra_list || [];
+      const fsid = list[0] && (list[0].to_fsid || list[0].fsid || list[0].fs_id);
+      return fsid ? String(fsid) : '';
+    },
+
     _needLogin() {
-      throw new Error('百度已关闭游客取链：请在本页登录百度账号后刷新重试（登录后免转存）');
+      throw new Error('百度分享页需要先登录：登录本页，或点下方按钮用令牌授权');
     },
 
     _check(json, fallback) {
@@ -1519,34 +1707,55 @@
     },
 
     async link(ctx, file) {
-      if (!ctx.logged) {
+      const hasToken = this.hasToken();
+      if (!ctx.logged && !hasToken) {
         throw new Error('百度已关闭游客取链：请在本页登录百度账号后刷新重试。登录后走「免转存」通道，不会往你网盘写任何文件');
       }
       const errors = [];
+      const dlHeaders = { 'User-Agent': BAIDU_DL_UA, 'Referer': 'https://pan.baidu.com/' };
 
       // 路线 A：分享直下（api/sharedownload），不转存、不占空间
       try {
         const url = await this._sharedownload(ctx, file);
         if (url) {
           return {
-            url,
-            headers: { 'User-Agent': BAIDU_UA_WEB, 'Referer': `https://pan.baidu.com/s/${ctx.id}` },
+            url: this._attachToken(url),
+            headers: dlHeaders,
             guest: false,
             filename: file.name,
             size: Number(file.size || 0),
-            note: '免转存直链，链接约 8 小时有效'
+            note: '免转存直链，链接约 8 小时有效（下载须带 UA：pan.baidu.com）'
           };
         }
       } catch (e) { errors.push('免转存：' + (e.message || e)); }
 
       // 路线 B：转存到自己网盘 → filemetas 取 dlink
+      //   B1 有 access_token 时走开放接口（最稳，不吃 bdstoken）
+      //   B2 没 token 时退回网页接口（吃 bdstoken）
+      if (hasToken) {
+        try {
+          const fsid = await this._transferByToken(ctx, file);
+          if (!fsid) throw new Error('转存成功但没拿到 fsid');
+          const url = await this._dlinkByToken(fsid);
+          if (!url) throw new Error('百度未返回 dlink');
+          return {
+            url,
+            headers: dlHeaders,
+            guest: false,
+            filename: file.name,
+            size: Number(file.size || 0),
+            note: `已转存到网盘 ${BAIDU_TMP_DIR}（可自行删除），链接 8 小时有效`
+          };
+        } catch (e) { errors.push('转存(token)：' + (e.message || e)); }
+      }
+
       try {
         const saved = await this._transfer(ctx, file);
         const url = await this._filemetas(ctx, saved.fid);
         if (!url) throw new Error('百度未返回 dlink');
         return {
-          url,
-          headers: { 'User-Agent': BAIDU_UA_NETDISK, 'Referer': 'https://pan.baidu.com/' },
+          url: this._attachToken(url),
+          headers: dlHeaders,
           guest: false,
           filename: file.name,
           size: Number(file.size || 0),
@@ -1585,9 +1794,7 @@
         product: 'share',
         uk: String(ctx.shareUk || ctx.uk || ''),
         primaryid: String(ctx.shareId || ''),
-        fid_list: JSON.stringify([Number(file.fid)]),
-        sign: String(d.sign),
-        timestamp: String(d.timestamp)
+        fid_list: JSON.stringify([Number(file.fid)])
       });
       if (ctx.sekey) body.set('extra', JSON.stringify({ sekey: ctx.sekey }));
 
@@ -1601,9 +1808,11 @@
       const res = await gmRequest({
         method: 'POST',
         url: `https://pan.baidu.com/api/sharedownload?${post}`,
-        headers: Object.assign(this._webHeaders(ctx), {
+        headers: {
+          'User-Agent': BAIDU_UA_NETDISK,
+          'Referer': `https://pan.baidu.com/s/${ctx.id}`,
           'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
-        }),
+        },
         data: body.toString()
       });
       const j = this._check(parseJSON(res, '分享直下失败'), '分享直下失败');
@@ -2275,6 +2484,39 @@
     }
   }
 
+  // 一键授权百度：打开授权页（脚本自动点允许）→ 回写 token → 重解析
+  async function doBaiduAuth() {
+    try {
+      // 已有令牌先校验，有效就不打扰用户重走授权
+      if (baidu.token()) {
+        const me = await baidu.verifyToken();
+        if (me) {
+          toastRootPush(`已授权：${me.netdisk_name || me.baidu_name || '百度网盘'}，正在重新解析…`);
+          state.links.clear();
+          if (state.shareUrl) await parseShare(state.shareUrl);
+          else render();
+          return;
+        }
+        toastRootPush('旧令牌已失效，重新授权中…', 'warn');
+      } else {
+        toastRootPush('正在打开百度授权页，请在弹出的页面确认「允许」…');
+      }
+      const t = await baidu.authorize();
+      if (!t) throw new Error('没有拿到令牌，请重试');
+      const me = await baidu.verifyToken();
+      if (!me) {
+        toastRootPush('拿到令牌但校验未通过，请重试一次授权', 'warn');
+      } else {
+        toastRootPush(`授权成功：${me.netdisk_name || me.baidu_name || '已授权'}，正在重新解析…`);
+      }
+      state.links.clear();
+      if (state.shareUrl) await parseShare(state.shareUrl);
+      else render();
+    } catch (e) {
+      toastRootPush(e.message || '授权失败', 'err');
+    }
+  }
+
   async function enterDir(item) {
     if (!state.platform || !state.ctx) return;
     state.loading = true;
@@ -2453,9 +2695,12 @@
     // 这样文件会出现在系统「下载」里，跟自己点链接下载完全一样；
     // 桌面油猴环境才用分片引擎（能暂停续传、能看到速度）
     const autoBrowser = IS_MOBILE || !HAS_GM_XHR;
-    // 百度 / 迅雷的直链校验 Cookie 与 UA，分片 fetch 改不了 UA 会 403，
-    // 直接交给浏览器下载器最稳（Cookie 由浏览器自己带）
-    const forceBrowser = !!(state.platform && state.platform.forceBrowser);
+    // 百度 / 迅雷的直链校验 Cookie 与 UA，分片 fetch 改不了 UA 会 403。
+    // 但百度拿到 access_token 后可以走 GM 通道改 UA（pan.baidu.com），
+    // 这时分片引擎反而更稳：能续传、能多线程，还绕开 50MB 的浏览器 403。
+    const baiduTokenMode = !!(state.platform && state.platform.id === 'baidu' &&
+      state.platform.hasToken && state.platform.hasToken());
+    const forceBrowser = !!(state.platform && state.platform.forceBrowser) && !baiduTokenMode;
     const mode = settings.downloadMode === 'auto'
       ? ((autoBrowser || forceBrowser) ? 'browser' : 'engine')
       : settings.downloadMode;
@@ -2534,12 +2779,16 @@
   function gmRaw(opt) {
     let handle = null;
     let aborted = false;
+    // 百度直链必须由 GM 通道发出，才能带上 UA「pan.baidu.com」；
+    // 走页面 fetch 会被 CORS 拦，且 UA 固定为浏览器标识（>50MB 直接 403）。
+    const wantBaiduUA = /^pan\.baidu\.com$/i.test(String((opt.headers || {})['User-Agent'] || ''));
     const promise = new Promise((resolve, reject) => {
       try {
         handle = httpRequest({
           method: opt.method || 'GET',
           url: opt.url,
           headers: opt.headers || {},
+          forceGM: wantBaiduUA,
           timeout: opt.timeout === 0 ? 0 : (opt.timeout || 0),
           responseType: opt.responseType || 'arraybuffer',
           onprogress: (e) => { if (opt.onprogress) opt.onprogress(e); },
@@ -3384,6 +3633,10 @@
               <option value="16">16 线程</option>
             </select>
           </div>
+          <div class="field">
+            <div><div class="lbl">百度访问令牌</div><div class="desc">手机等无 GM 存储的环境：授权后把令牌粘到这里</div></div>
+            <input class="search" id="yx-baidu-token" placeholder="access_token" style="width:132px;height:30px">
+          </div>
           <div class="field" style="border:0;color:#94a3b8;font-size:11.5px">
             <div>版本 v${APP.version} · 无口令 / 无授权码</div>
             <button class="btn" id="yx-set-back">返回</button>
@@ -3506,6 +3759,16 @@
         const st = document.getElementById('yx-adblock');
         if (st) st.remove();
         initAdBlock();
+      });
+    }
+    // 手动填百度令牌（手机无 GM 存储时的兜底）
+    const bt = root.getElementById('yx-baidu-token');
+    if (bt) {
+      bt.value = baidu.token();
+      bt.addEventListener('change', () => {
+        const v = bt.value.trim();
+        GMStore.set(BAIDU_TOKEN_KEY, v);
+        toastRootPush(v ? '百度令牌已保存' : '百度令牌已清除', v ? 'ok' : 'info');
       });
     }
 
@@ -3669,8 +3932,9 @@
     const tag = root.getElementById('yx-tag');
     if (state.ctx) {
       tag.style.display = '';
-      tag.textContent = state.ctx.logged ? '已登录' : (state.platform.guestLabel || '游客');
-      tag.className = 'tag' + (state.ctx.logged ? '' : ' guest');
+      const tok = state.platform && state.platform.id === 'baidu' && state.platform.hasToken && state.platform.hasToken();
+      tag.textContent = tok ? '已授权' : (state.ctx.logged ? '已登录' : (state.platform.guestLabel || '游客'));
+      tag.className = 'tag' + (tok || state.ctx.logged ? '' : ' guest');
     } else {
       tag.style.display = 'none';
     }
@@ -3684,6 +3948,16 @@
       sub.textContent = `${state.platform.name} · ${files} 个文件${dirs ? `，${dirs} 个文件夹` : ''}${state.ctx.logged ? '' : ' · ' + (state.platform.guestHint || '游客态有大小限制')}`;
     } else {
       sub.textContent = '粘贴分享链接，一键获取直链';
+    }
+
+    // 百度：没登录 / 没令牌时，给一个「授权百度」快捷入口（错误区已有主按钮时不重复）
+    if (state.platform && state.platform.id === 'baidu' && !(state.ctx && state.ctx.logged) && !state.error) {
+      const hasTok = state.platform.hasToken && state.platform.hasToken();
+      const label = hasTok ? '令牌已授权，重新解析' : '一键授权百度网盘';
+      sub.innerHTML = `<span>${esc(sub.textContent || '')}</span>
+        <a data-yx-auth="1" style="margin-left:8px;color:#6aa8ff;cursor:pointer;text-decoration:underline">${label}</a>`;
+      const link = sub.querySelector('[data-yx-auth]');
+      if (link) link.onclick = (e) => { e.preventDefault(); doBaiduAuth(); };
     }
 
     const crumb = root.getElementById('yx-crumb');
@@ -3773,22 +4047,31 @@
 
     if (state.error) {
       const needPwd = /密码|提取码|口令|passcode/i.test(state.error);
-      const needLogin = /登录|未登录|账号/i.test(state.error) && !needPwd;
+      const needLogin = /登录|未登录|账号|授权/i.test(state.error) && !needPwd;
       const loginUrl = (state.platform && state.platform.cookieUrl) || 'https://pan.baidu.com/';
+      const isBaidu = !!(state.platform && state.platform.id === 'baidu');
       box.innerHTML = `<div class="empty"><div class="big">${ICON.warn}</div><div class="err">${esc(state.error)}</div>
-        ${needLogin ? `<div class="pwbar">
+        ${needLogin ? (isBaidu ? `<div class="pwbar">
+          <button class="btn primary" id="yx-auth">一键授权百度网盘</button>
+          <button class="btn" id="yx-relogin">我已登录，重试</button>
+        </div>
+        <div class="hint" style="margin-top:10px;font-size:12px;opacity:.62;line-height:1.6">
+          授权只申请「网盘读写」权限，用来生成下载直链，不读你的账号资料，令牌存在本地、30 天有效。
+        </div>` : `<div class="pwbar">
           <a class="btn primary" id="yx-login" href="${esc(loginUrl)}" target="_blank" rel="noopener">去登录</a>
           <button class="btn" id="yx-relogin">我已登录，重试</button>
-        </div>` : `<div class="pwbar">
+        </div>`) : `<div class="pwbar">
           <input id="yx-pwd" placeholder="提取码（如需要）" value="${esc(state.ctx.pwd || '')}">
           <button class="btn" id="yx-retry">重试</button>
         </div>`}</div>`;
       const retry = box.querySelector('#yx-retry');
       const relogin = box.querySelector('#yx-relogin');
       const pwd = box.querySelector('#yx-pwd');
+      const authBtn = box.querySelector('#yx-auth');
       const again = () => parseShare(state.shareUrl || location.href, pwd ? pwd.value : '');
       if (retry) retry.addEventListener('click', again);
       if (relogin) relogin.addEventListener('click', again);
+      if (authBtn) authBtn.addEventListener('click', doBaiduAuth);
       if (pwd) {
         pwd.addEventListener('keydown', (e) => { if (e.key === 'Enter') again(); });
         if (needPwd) setTimeout(() => pwd.focus(), 30);
@@ -3879,8 +4162,10 @@
     }
     const total = state.items.filter((i) => !i.dir).length;
     const sel = state.selected.size;
-    el.textContent = `${state.platform.name} · 共 ${total} 个文件 · 已选 ${sel} · ${state.ctx.logged ? '登录态' : (state.platform.guestLabel || '游客态')}`;
-    dot.className = 'dot' + (state.ctx.logged ? '' : ' guest');
+    const tok = state.platform.id === 'baidu' && state.platform.hasToken && state.platform.hasToken();
+    const mode = tok ? '令牌已授权' : (state.ctx.logged ? '登录态' : (state.platform.guestLabel || '游客态'));
+    el.textContent = `${state.platform.name} · 共 ${total} 个文件 · 已选 ${sel} · ${mode}`;
+    dot.className = 'dot' + (state.ctx.logged || tok ? '' : ' guest');
 
     const allBtn = root.getElementById('yx-select-all');
     if (allBtn) {
@@ -4012,6 +4297,100 @@
     }
   }
 
+  /* =======================================================================
+   * 百度 OAuth 授权页（openapi.baidu.com）
+   *   1) /oauth/2.0/authorize  → 自动点「允许」
+   *   2) /oauth/2.0/login_success → 从地址栏抓 access_token 写回存储
+   * 这个页面只做这两件事，不挂面板。
+   * ===================================================================== */
+  function yxAuthBanner(html) {
+    let el = document.getElementById('yx-auth-banner');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'yx-auth-banner';
+      el.style.cssText = [
+        'position:fixed', 'z-index:2147483647', 'left:50%', 'top:18px',
+        'transform:translateX(-50%)', 'background:#1b1f27', 'color:#fff',
+        'padding:12px 18px', 'border-radius:12px',
+        'font:14px/1.65 system-ui,-apple-system,"Segoe UI",sans-serif',
+        'box-shadow:0 10px 34px rgba(0,0,0,.45)', 'max-width:88vw', 'text-align:center'
+      ].join(';');
+      (document.body || document.documentElement).appendChild(el);
+    }
+    el.innerHTML = html;
+    return el;
+  }
+
+  function baiduAuthPage() {
+    const href = location.href;
+
+    // ① 授权确认页：自动点「允许」，省掉用户找按钮
+    if (/\/oauth\/2\.0\/authorize/.test(href)) {
+      const onLoginBox = !!document.querySelector('#TANGRAM_3__submit, .pass-form');
+      yxAuthBanner(
+        onLoginBox
+          ? '云析直链：请先在此页<b>登录百度账号</b><br>' +
+            '<span style="opacity:.65;font-size:12px">登录后本页会自动帮你点「允许」</span>'
+          : '云析直链：正在自动确认授权…'
+      );
+      let n = 0;
+      const iv = setInterval(() => {
+        n++;
+        const btn =
+          document.querySelector('#auth-allow') ||
+          document.querySelector('button[class*="allow"]') ||
+          Array.from(document.querySelectorAll('button, a, input[type=button], input[type=submit]'))
+            .find((b) => /^(允许|授权|同意|允许访问|确认授权)/.test((b.innerText || b.value || '').trim()));
+        if (btn && !/submit/i.test(btn.id || '')) {
+          clearInterval(iv);
+          try { btn.click(); } catch (e) { /* ignore */ }
+          yxAuthBanner('云析直链：已自动点击「允许」，正在跳转…');
+          return;
+        }
+        if (n > 900) clearInterval(iv); // 最多等 6 分钟
+      }, 400);
+      return;
+    }
+
+    // ② 授权成功页：地址栏里带 access_token
+    if (/login_success|\/oauth\/2\.0\/(?!authorize)/.test(href)) {
+      let saved = false;
+      const grab = () => {
+        if (saved) return true;
+        const m = String(location.href).match(/access_token=([^&#]+)/);
+        if (!m) return false;
+        const token = decodeURIComponent(m[1]);
+        if (!token || token.length < 16) return false;
+        saved = true;
+        try {
+          GMStore.set(BAIDU_TOKEN_KEY, token);
+          GMStore.set('baidu_access_token_at', Date.now());
+        } catch (e) { /* ignore */ }
+        // 无 GM 环境（手机脚本引擎）时，跨域写不进主页面，给用户手动复制的兜底
+        const manual = !HAS_GM_STORE;
+        yxAuthBanner(
+          '✅ 百度授权成功' +
+            (manual
+              ? '<br><span style="font-size:12px;opacity:.8">请长按复制下面这串令牌，回到网盘页面粘贴：</span>' +
+                `<br><textarea readonly style="width:min(520px,80vw);height:64px;margin-top:8px;font-size:12px;background:#0e1116;color:#8fd;border:1px solid #333;border-radius:8px;padding:6px">${token}</textarea>`
+              : '<br><span style="font-size:12px;opacity:.75">令牌已保存，3 秒后自动关闭本页</span>')
+        );
+        if (!manual) setTimeout(() => { try { window.close(); } catch (e) { /* ignore */ } }, 2800);
+        return true;
+      };
+      if (grab()) return;
+      yxAuthBanner('云析直链：等待百度返回授权结果…');
+      let n = 0;
+      const iv = setInterval(() => {
+        n++;
+        if (grab() || n > 900) clearInterval(iv);
+      }, 200);
+      return;
+    }
+
+    // ③ 其它 openapi 页面：不打扰
+  }
+
   function boot() {
     DL.restore();
     mountUI();
@@ -4043,7 +4422,10 @@
     }, 1200);
   }
 
-  if (document.readyState === 'loading') {
+  // 百度 OAuth 授权页只做「自动授权 + 收 token」，不加载面板
+  if (/(^|\.)openapi\.baidu\.com$/.test(location.hostname)) {
+    baiduAuthPage();
+  } else if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', boot);
   } else {
     boot();

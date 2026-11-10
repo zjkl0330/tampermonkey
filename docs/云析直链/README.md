@@ -93,7 +93,7 @@
 | 天翼云盘 `cloud.189.cn/t/xxx` | ⚠️ 需登录 | ⚠️ 需登录 | 游客 `sessionKey=null`，登录后同源请求自动带 Cookie |
 | 移动云盘 `yun.139.com/w/#/w/i/xxx` | ✅ 游客 | ⚠️ 需登录 | 请求体 AES-CBC 加密（key `PVGDwmcvfs1uV3d1`，IV 前置，响应可能 gzip），浏览器 Web Crypto 实测 `resultCode: 0`；取链返回 `200000401 IP鉴权失败、用户账号鉴权失败` |
 | 阿里云盘 `alipan.com/s/xxx` | ✅ 游客 | ⚠️ 需登录 | 匿名 `share_token` 可列目录；`get_download_url` 返回 `AccessTokenInvalid` |
-| 百度网盘 `pan.baidu.com/s/1xxx` | ⚠️ 需登录 | ✅ 登录后免转存直链 | `tplconfig → api/sharedownload`；游客 `errno=-6`（官方已关） |
+| 百度网盘 `pan.baidu.com/s/1xxx` | ⚠️ 列目录需登录 | ✅ 授权后可用 | 一键 OAuth 拿 `access_token` → `xpan/multimedia?method=filemetas`；下载必须 `UA: pan.baidu.com` + `access_token` 参数 |
 | 迅雷云盘 `pan.xunlei.com/s/xxx` | ✅ 游客可浏览全目录 | ⚠️ 下载需登录（转存后取链） | 9 层 md5 换 `X-Captcha-Token`，匿名可列目录，`web_content_link` 匿名为空 |
 | 城通网盘 `url95.ctfile.com/f/xxx` | ✅ 游客 | ✅ 游客 | ALTCHA-PBKDF2 人机验证本地可解（0.5s）；单连接限速 30KB/s，多连接实测 8 路 1.4MB/s |
 
@@ -149,9 +149,37 @@
 
 响应可能 gzip：解密后前两字节是 `1f 8b` 就用 `DecompressionStream('gzip')` 再解一次。浏览器里用 Web Crypto 实测 `resultCode: 0`，三级目录全部列通。
 
-### 百度网盘（登录后免转存）
+### 百度网盘（AccessToken 主路线 + 免转存兜底）
 
-**路线 A · 免转存（默认，首选）**
+百度是十家里最麻烦的一家：2023 年关掉游客取链后，网页端所有取链接口都只认登录 Cookie，而最关键的两个值（`BDUSS`）又是 **HttpOnly**，脚本根本读不到。2026-11 这版改成**开放平台 OAuth 令牌**，把这条死路绕开了。
+
+**路线 0 · 一键授权（推荐，v1.8.0 新增）**
+
+```
+1. 面板点「一键授权百度网盘」
+   → 打开 openapi.baidu.com/oauth/2.0/authorize?response_type=token
+             &scope=basic,netdisk&client_id=<公开 client_id>&redirect_uri=oob
+2. 授权页由脚本自动点「允许」（登录框状态下会提示你先登录）
+3. 跳转 login_success#access_token=xxx → 脚本抓 token 存本地（30 天有效）
+4. GET /rest/2.0/xpan/nas?method=uinfo&access_token=   → 校验 + 显示账号名
+```
+
+拿到令牌后，取链和下载都只认它，**不再依赖 bdstoken，也不怕页面改版**：
+
+```
+5. GET /rest/2.0/xpan/multimedia?method=filemetas&dlink=1
+       &fsids=[fsid]&access_token=            → list[0].dlink
+6. 下载：GET {dlink}&access_token=xxx
+       Header: User-Agent: pan.baidu.com      ← 少了这个必 403
+```
+
+> **两条硬性约束**（百度开放平台官方文档原文，不是经验之谈）：
+> ① `access_token` 必须**拼在 dlink 的查询串上**，不是 Header；
+> ② `User-Agent` 必须是 `pan.baidu.com`。
+> 官方错误码：`31045` 令牌失效 / `31362` 签名错误 / `31326` 命中防盗链（UA 不对）/ `31360` 链接过期（dlink 8 小时）。
+> 之前「百度用不了」的根因就在这里：浏览器直接点 dlink 时 UA 是 Chrome，超过 50MB 会被判防盗链 403。
+
+**路线 A · 免转存（分享直下，登录态可用时先试）**
 
 ```
 1. 页面上下文取 bdstoken / jsToken / share_uk / shareid / sekey
@@ -160,26 +188,30 @@
 2. GET  /share/tplconfig?fields=sign,timestamp&surl=1xxxx&bdstoken=&logid=
                                                              → sign / timestamp
 3. POST /api/sharedownload?sign=&timestamp=&bdstoken=&logid=&jsToken=
+        Header: User-Agent: netdisk;            ← 网页 UA 会被拒
         encrypt=0&product=share&uk=&primaryid=&fid_list=[fsid]&extra={"sekey":""}
                                                              → list[0].dlink
 ```
 
-不写入网盘、不占空间，链接约 8 小时有效。**登录是硬门槛**：2023 年后百度关闭了游客取链（`errno=-6`），纯前端绕不过，第三方解析站靠的是自家账号池（服务端），脚本做不到也不做。
+不写入网盘、不占空间，链接约 8 小时有效。`list` 返回字符串时表示「文件过大，需转存后下载」。
 
 **路线 B · 转存兜底（A 失败才走）**
 
+有令牌时走开放接口（更稳）：
+
 ```
-4. POST /api/create?a=commit  path=/yunx          → 确保临时目录存在
-5. POST /share/transfer?shareid=&from=uk&sekey=   → extra.list[0].to_fs_id
-6. GET  /api/filemetas?dlink=1&fsids=[id]&bdstoken= → info[0].dlink
+4. POST /rest/2.0/xpan/share?method=transfer&access_token=&shareid=&from=uk&sekey=
+        fsidlist=[fsid]&path=/yunx                      → list[0].to_fsid
+5. GET  /rest/2.0/xpan/multimedia?method=filemetas&dlink=1&fsids=[新fsid]
 ```
 
-第 6 步换成了网页版真实接口 `api/filemetas`，不再用 `d.pcs.baidu.com/.../locatedownload`——后者的 `psign` / `devuid` 是写死的历史参数，早已失效，这是之前「登录了也取不到链」的主因。
+没令牌时退回网页接口：`api/create?a=commit` 建目录 → `share/transfer` → `api/filemetas?dlink=1`。
 
 其他坑：
 - 子目录 `root` 必须 `0`，根目录 `1`；
 - 子目录必须带 `BDCLND` Cookie（= 提取码换来的 `randsk`），否则 `errno=2`；
-- `BDUSS` 是 **HttpOnly**，`document.cookie` 和 `GM_cookie` 都读不到，所以**不能用 Cookie 判断登录态**——这正是旧版「明明登录了却提示未登录」的原因，现在改用 `locals.loginstate` + 接口回包兜底。
+- `BDUSS` 是 **HttpOnly**，`document.cookie` 和 `GM_cookie` 都读不到，所以**不能用 Cookie 判断登录态**——这正是旧版「明明登录了却提示未登录」的原因，现在改用 `locals.loginstate` + 接口回包兜底；
+- 下载走分片引擎，而不是交给浏览器：只有 `GM_xmlhttpRequest` 才能把 UA 改成 `pan.baidu.com`，顺带拿到断点续传和多线程。
 
 ### 迅雷云盘（captcha 签名）
 
@@ -279,8 +311,12 @@ MD5 是脚本内自带的实现（零依赖），已和 Node 的 `crypto` 逐条
 | 移动云盘加密 | 浏览器 `crypto.subtle` AES-CBC 加密后 `getOutLinkInfoV6` 返回 `{"resultCode":"0","success":true}`，三级目录递归成功 |
 | 阿里云盘 `FUh4ciwFesR` | 匿名 `share_token` 列目录成功：`20231226.[Android] Easy Voice Recorder v2.8.7高级录音(9mb) .rar`，6.6MB |
 | 阿里取链（游客） | `get_download_url` 返回 `{"code":"AccessTokenInvalid","message":"access token is blank"}`，脚本提示「请先登录」 |
-| 百度分享（游客） | `xpan/share` 返回 `errno=-6`；面板显示登录引导 + 「去登录 / 我已登录，重试」两个按钮 |
+| 百度分享（游客） | `xpan/share` 返回 `errno=-6`；面板显示「一键授权百度网盘 / 我已登录，重试」 |
 | 百度直链 | `locatedownload` 的写死 `psign` 已废弃 → 改用 `api/filemetas?dlink=1`；新增 `api/sharedownload` 免转存通道 |
+| 百度 OAuth 授权页 | 实测 `openapi.baidu.com/oauth/2.0/authorize` 返回 200、应用名显示 `OpenList`（client_id 未被封）；未登录时为登录框，脚本按 DOM 判断并提示先登录 |
+| 百度令牌抓取 | 构造 `login_success#access_token=…` 页面实测：脚本抓到令牌并写入 GM 存储，无 JS 报错 |
+| 百度自动授权 | 注入 `button#auth-allow` 后 2.5s 内被自动点中，横幅切换为「已自动点击允许」 |
+| 百度下载头 | 官方文档：`GET {dlink}&access_token=xxx` + `User-Agent: pan.baidu.com` 必填；UA 不符 → `31326` / 403 |
 | 迅雷游客全链路 | 自算签名换 token → `crypto` 比对一致；`share` 与 `share/detail` 逐层列目录全通（根→子→文件）；文件 `web_content_link` 为空，故下载必须登录 |
 | 迅雷 CORS | 之前 `fetch` 带 `Origin` / `X-Client-Version` 触发预检失败（`Access-Control-Allow-Headers` 不含），删掉后 `200` |
 
