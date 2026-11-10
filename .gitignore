@@ -1,0 +1,14 @@
+# 第三方分享的二进制样本，不入库
+月虹提权助手/
+
+# 探针输出
+research/**/probe/*.png
+research/**/probe/*.json
+
+# Python
+__pycache__/
+*.pyc
+
+# 系统
+.DS_Store
+Thumbs.db
