@@ -3950,10 +3950,9 @@
       sub.textContent = '粘贴分享链接，一键获取直链';
     }
 
-    // 百度：没登录 / 没令牌时，给一个「授权百度」快捷入口（错误区已有主按钮时不重复）
-    if (state.platform && state.platform.id === 'baidu' && !(state.ctx && state.ctx.logged) && !state.error) {
-      const hasTok = state.platform.hasToken && state.platform.hasToken();
-      const label = hasTok ? '令牌已授权，重新解析' : '一键授权百度网盘';
+    // 百度：没有令牌就给一个「授权」快捷入口（错误区已有主按钮时不重复）
+    if (state.platform && state.platform.id === 'baidu' && state.platform.hasToken && !state.platform.hasToken() && !state.error) {
+      const label = '一键授权百度网盘（提升取链成功率）';
       sub.innerHTML = `<span>${esc(sub.textContent || '')}</span>
         <a data-yx-auth="1" style="margin-left:8px;color:#6aa8ff;cursor:pointer;text-decoration:underline">${label}</a>`;
       const link = sub.querySelector('[data-yx-auth]');
