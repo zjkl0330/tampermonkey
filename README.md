@@ -2,6 +2,19 @@
 
 个人油猴脚本仓库。
 
+## 安装
+
+**云析直链**（Tampermonkey 装好后直接打开这个地址）：
+
+```
+https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%90%E7%9B%B4%E9%93%BE.user.js
+```
+
+装完不用再管：脚本头里写了 `@updateURL` / `@downloadURL`，篡改猴会自己按周期拉新版；面板「设置 → 检查更新」也能手动查、看到 `v1.9.0 → v2.0.0 可更新` 这类提示。
+
+> raw 域名国内偶尔不通，可换镜像：
+> `https://gh.zjkl0330.dpdns.org/zjkl0330/tampermonkey/raw/main/js/%E4%BA%91%E6%9E%90%E7%9B%B4%E9%93%BE.user.js`
+
 ## 脚本
 
 | 脚本 | 说明 | 文档 |

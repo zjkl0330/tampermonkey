@@ -19,6 +19,49 @@
 
 **手机上装**：用支持用户脚本的浏览器（X 浏览器 / Via / 夸克自带脚本管理等），直接导入同一个 `.user.js` 即可。这类环境通常没有 `GM_xmlhttpRequest`，脚本会自动切到 `fetch` + `localStorage`，下载交给系统浏览器 —— 不会再出现 `GM_xmlhttpRequest is not defined` 的白板。
 
+### 从 GitHub 安装（推荐，带自动更新）
+
+```
+https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%90%E7%9B%B4%E9%93%BE.user.js
+```
+
+浏览器直接打开这个地址，篡改猴会弹安装页。用这个地址装的脚本**会自己检查更新**：
+
+| 机制 | 行为 |
+| --- | --- |
+| `@updateURL` / `@downloadURL` | 已写进脚本头，篡改猴默认每 24 小时拉一次新版本，有更新时扩展图标亮红点 |
+| 面板「设置 → 检查更新」 | 手动查：显示 `版本 v1.9.0 → v2.0.0 可更新`，确认后直接跳安装页 |
+| 静默日检 | 每次打开页面时，距上次检查超过 24 小时才查一次；没新版不弹任何东西 |
+| 版本对照 | 设置面板底部显示当前版本，仓库 `js/云析直链.user.js` 头部是同一份 `@version` |
+
+更新失败时脚本会**说出原因**（HTTP 码 / 网络不通 / 域名没授权），不会只丢一句「网络错误」。
+
+> `raw.githubusercontent.com` 在国内偶尔连不上。连不上就把 `@updateURL` / `@downloadURL` 换成镜像：
+> `https://gh.zjkl0330.dpdns.org/zjkl0330/tampermonkey/raw/main/js/%E4%BA%91%E6%9E%90%E7%9B%B4%E9%93%BE.user.js`
+> 或者直接重新下载覆盖安装，设置（含百度令牌）存在扩展里，不会丢。
+
+### 运行范围（v1.9.0 起收窄）
+
+早期版本是「域名级全站匹配」，连登录页、会员页都会挂悬浮球。现在只在**分享页**注入：
+
+| 平台 | 启用的路径 |
+| --- | --- |
+| 夸克 | `pan.quark.cn/`、`pan.quark.cn/s/*` |
+| UC | `drive.uc.cn/s/*` |
+| 123 云盘 | `www.123865.com/s/*`、`www.123pan.com/s/*`、`www.123pan.cn/s/*`、`yun.123pan.cn/*`、`share.123pan.cn/123pan/*` |
+| 115 | `115.com/s/*`、`115cdn.com/s/*`、`115rc.com/s/*` |
+| 天翼 | `cloud.189.cn/t/*`、`cloud.189.cn/web/share*` |
+| 移动 | `yun.139.com/*`、`caiyun.139.com/*`（分享走 hash 路由，路径太多，保留全域） |
+| 百度 | `pan.baidu.com/s/*`、`pan.baidu.com/share/*`、`yun.baidu.com/s/*`、`openapi.baidu.com/*`（授权页） |
+| 迅雷 | `pan.xunlei.com/s/*` |
+| 阿里 | `www.alipan.com/s/*`、`www.aliyundrive.com/s/*` |
+| 城通 | `*.ctfile.com/*`、`*.ctfile.net/*`、`*.545c.com/*` |
+
+另外统一排除：`/passport/*`、`/login*`、`/register*`、`/reg.html*`、`/vip*`、`/pay*`、`/about/*`、`/help*`。
+
+**连接域**（`@connect`）也一并从 `*` 收紧成具体域 + 通配：百度 / 迅雷 / 夸克 / UC / 123 / 115 / 天翼 / 移动 / 阿里 / 城通的接口域与 CDN，加 GitHub raw（更新用）。真遇到某个 CDN 不在清单里，下载会明确提示「域名未授权：…（该 CDN 不在 @connect 列表）」，在篡改猴弹窗点「总是允许」即可，不会再假报「网络错误」。
+
+
 ## 二、使用
 
 | 操作 | 说明 |
@@ -355,6 +398,17 @@ MD5 是脚本内自带的实现（零依赖），已和 Node 的 `crypto` 逐条
 
 **面板挡住了页面？**
 `Esc` 关闭；设置里可以关掉悬浮球，用油猴菜单「⚡ 打开直链面板」唤起。
+
+**为什么网盘首页没有悬浮球了？**
+v1.9.0 起只在分享页注入（`/s/…`、`/t/…`、`/f/…`），登录页、会员页、个人盘不再运行。要解析分享链接，直接打开分享页即可。
+
+**检查更新报「拉取失败 / 网络不通」？**
+`raw.githubusercontent.com` 在国内不稳定，多试一次通常就好。长期不通就把脚本头里 `@updateURL`、`@downloadURL` 两行换成镜像
+`https://gh.zjkl0330.dpdns.org/zjkl0330/tampermonkey/raw/main/js/%E4%BA%91%E6%9E%90%E7%9B%B4%E9%93%BE.user.js`；
+或者手动下载覆盖安装——设置和百度令牌存在扩展里，不会丢。
+
+**下载提示「域名未授权：…」？**
+v1.9.0 把 `@connect` 从 `*` 收紧成了具体 CDN 列表。碰到没列进去的域，篡改猴会弹「是否允许」，点「总是允许」即可；这条提示就是为了让你知道是权限问题，而不是网络问题。
 
 ## 九、和 YunX App 的区别
 

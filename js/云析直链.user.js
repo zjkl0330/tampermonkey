@@ -1,44 +1,72 @@
 // ==UserScript==
 // @name         云析直链 · 网盘直链下载助手
 // @namespace    https://github.com/CYQawa/YunX
-// @version      1.8.0
+// @version      1.9.0
 // @author       云析直链（YunX 移植）
 // @description  夸克 / UC / 123 / 115 / 天翼 / 移动 / 百度 / 迅雷 / 阿里 / 城通 网盘分享直链解析，附分享页去广告：自动列目录、8 线程分片下载、暂停续传，可导出 IDM / Aria2 / cURL 命令。无口令、无授权码，装上即用。
 // @license      AGPL-3.0-or-later
 // @homepage     https://github.com/CYQawa/YunX
-// @match        https://pan.quark.cn/*
-// @match        https://drive.uc.cn/*
-// @match        https://www.123865.com/*
-// @match        https://www.123pan.com/*
-// @match        https://www.123pan.cn/*
+// @supportURL   https://github.com/zjkl0330/tampermonkey/issues
+// @updateURL    https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%90%E7%9B%B4%E9%93%BE.user.js
+// @downloadURL  https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%90%E7%9B%B4%E9%93%BE.user.js
+// @match        https://pan.quark.cn/
+// @match        https://pan.quark.cn/s/*
+// @match        https://drive.uc.cn/s/*
+// @match        https://www.123865.com/s/*
+// @match        https://www.123pan.com/s/*
+// @match        https://www.123pan.cn/s/*
 // @match        https://yun.123pan.cn/*
+// @match        https://share.123pan.cn/123pan/*
 // @match        https://115.com/s/*
 // @match        https://115cdn.com/s/*
 // @match        https://115rc.com/s/*
-// @match        https://cloud.189.cn/*
+// @match        https://cloud.189.cn/t/*
+// @match        https://cloud.189.cn/web/share*
 // @match        https://yun.139.com/*
 // @match        https://caiyun.139.com/*
-// @match        https://pan.baidu.com/*
-// @match        https://yun.baidu.com/*
-// @match        https://openapi.baidu.com/*
-// @match        https://pan.xunlei.com/*
+// @match        https://pan.baidu.com/s/*
+// @match        https://pan.baidu.com/share/*
+// @match        https://yun.baidu.com/s/*
+// @match        https://openapi.baidu.com/oauth/*
+// @match        https://pan.xunlei.com/s/*
 // @match        https://*.ctfile.com/*
-// @match        https://ctfile.com/*
+// @match        https://*.ctfile.net/*
 // @match        https://*.545c.com/*
-// @match        https://www.alipan.com/*
-// @match        https://www.aliyundrive.com/*
-// @connect      115.com
-// @connect      189.cn
-// @connect      139.com
-// @connect      baidu.com
-// @connect      baidupcs.com
-// @connect      xunlei.com
-// @connect      aliyundrive.com
-// @connect      quark.cn
-// @connect      uc.cn
-// @connect      123pan.cn
-// @connect      123865.com
-// @connect      *
+// @match        https://www.alipan.com/s/*
+// @match        https://www.aliyundrive.com/s/*
+// @exclude      *://*/passport/*
+// @exclude      *://*/login*
+// @exclude      *://*/register*
+// @exclude      *://*/reg.html*
+// @exclude      *://*/vip*
+// @exclude      *://*/pay*
+// @exclude      *://*/about/*
+// @exclude      *://*/help*
+// @connect      pan.baidu.com
+// @connect      openapi.baidu.com
+// @connect      *.baidu.com
+// @connect      *.baidupcs.com
+// @connect      *.xunlei.com
+// @connect      *.quark.cn
+// @connect      *.uc.cn
+// @connect      *.123pan.cn
+// @connect      *.123pan.com
+// @connect      *.123865.com
+// @connect      *.189.cn
+// @connect      *.ctyunxs.cn
+// @connect      *.139.com
+// @connect      *.mcloud.com
+// @connect      *.aliyundrive.com
+// @connect      *.alipan.com
+// @connect      *.aliyuncs.com
+// @connect      *.ctfile.com
+// @connect      *.ctfile.net
+// @connect      *.545c.com
+// @connect      *.115.com
+// @connect      *.115cdn.com
+// @connect      *.115rc.com
+// @connect      raw.githubusercontent.com
+// @connect      api.github.com
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setClipboard
 // @grant        GM_getValue
@@ -58,7 +86,7 @@
    * 0. 常量
    * ===================================================================== */
 
-  const APP = { name: '云析直链', version: '1.8.0' };
+  const APP = { name: '云析直链', version: '1.9.0' };
 
   // 夸克 PC 客户端 UA：列表 / 取链接口都校验它
   const UA_QUARK =
@@ -231,7 +259,7 @@
       method: (opt.method || 'GET').toUpperCase(),
       headers,
       body: opt.data === undefined || opt.data === null ? undefined : opt.data,
-      credentials: 'include',
+      credentials: opt.credentials || 'include',
       redirect: 'follow',
       signal: ctl.signal
     }).then(async (r) => {
@@ -354,11 +382,20 @@
           headers: opt.headers || {},
           data: opt.data,
           forceGM: opt.forceGM,
+          credentials: opt.credentials,
           timeout: opt.timeout === 0 ? 0 : (opt.timeout || 25000),
           responseType: opt.responseType || 'text',
           onload: (r) => done(resolve, r),
           onprogress: (e) => { if (opt.onprogress) opt.onprogress(e); },
-          onerror: () => done(reject, new Error('网络错误：无法连接服务器（可能需要代理）')),
+          onerror: (r) => {
+            const raw = String((r && (r.error || r.statusText)) || '');
+            // @connect 白名单没覆盖到的域会被脚本管理器直接拒绝，
+            // 这种错必须说清是「没授权这个域」，否则用户只会看到「网络错误」无从下手
+            const blocked = /connect|refused|permission|not allowed|not permitted|CSP|blocked/i.test(raw);
+            done(reject, new Error(blocked
+              ? `域名未授权：${raw}（该 CDN 不在 @connect 列表，请在脚本管理器里允许）`
+              : '网络错误：无法连接服务器（可能需要代理）'));
+          },
           ontimeout: () => done(reject, new Error('请求超时，请重试')),
           onabort: () => done(reject, new Error('请求已取消'))
         });
@@ -3638,8 +3675,12 @@
             <input class="search" id="yx-baidu-token" placeholder="access_token" style="width:132px;height:30px">
           </div>
           <div class="field" style="border:0;color:#94a3b8;font-size:11.5px">
-            <div>版本 v${APP.version} · 无口令 / 无授权码</div>
-            <button class="btn" id="yx-set-back">返回</button>
+            <div id="yx-update-line">版本 v${APP.version} · 无口令 / 无授权码</div>
+            <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+              <button class="btn" id="yx-check-update">检查更新</button>
+              <button class="btn" id="yx-repo">项目主页</button>
+              <button class="btn" id="yx-set-back">返回</button>
+            </div>
           </div>
         </div>
       </div>
@@ -3669,6 +3710,13 @@
     on('yx-new', 'click', () => { resetShare(); state.settingsOpen = false; render(); });
     on('yx-set', 'click', () => { state.settingsOpen = true; render(); });
     on('yx-set-back', 'click', () => { state.settingsOpen = false; render(); });
+    on('yx-check-update', 'click', () => checkUpdate(true));
+    on('yx-repo', 'click', () => {
+      try {
+        if (typeof GM_openInTab === 'function') return GM_openInTab(REPO_URL, { active: true, insert: true });
+      } catch (e) { /* ignore */ }
+      window.open(REPO_URL, '_blank', 'noopener');
+    });
     on('yx-refresh', 'click', () => { if (state.shareUrl) parseShare(state.shareUrl); else openPanel(); });
     on('yx-copy-sel', 'click', copySelected);
     on('yx-select-all', 'click', selectAll);
@@ -3981,6 +4029,7 @@
     // 设置面板
     const set = root.getElementById('yx-settings');
     set.classList.toggle('on', state.settingsOpen);
+    if (state.settingsOpen) renderUpdateLine();
     $$('.switch', root).forEach((sw) => {
       sw.classList.toggle('on', !!settings[sw.dataset.key]);
     });
@@ -4400,6 +4449,98 @@
     // ③ 其它 openapi 页面：不打扰
   }
 
+  /* =======================================================================
+   * 7. 自动更新（分发源：GitHub raw）
+   * -----------------------------------------------------------------------
+   * @updateURL / @downloadURL 已指向仓库，脚本管理器会自己按周期拉新版；
+   * 这里再补一层：面板内手动检查 + 每 24 小时静默检查，方便看版本差异。
+   * ===================================================================== */
+
+  const RAW_URL =
+    'https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%90%E7%9B%B4%E9%93%BE.user.js';
+  const REPO_URL = 'https://github.com/zjkl0330/tampermonkey';
+
+  function vnum(v) {
+    return String(v || '0').split('.').map((x) => parseInt(x, 10) || 0);
+  }
+
+  function cmpVersion(a, b) {
+    const x = vnum(a);
+    const y = vnum(b);
+    const n = Math.max(x.length, y.length);
+    for (let i = 0; i < n; i++) {
+      const d = (x[i] || 0) - (y[i] || 0);
+      if (d) return d > 0 ? 1 : -1;
+    }
+    return 0;
+  }
+
+  async function fetchRemoteVersion() {
+    // 只要脚本头 2KB：Range 是 CORS 安全请求头，不用预检；
+    // 整包 16 万字节在部分手机浏览器里读 body 会卡住，取头又准又快
+    const res = await gmRequest({
+      method: 'GET',
+      url: `${RAW_URL}?t=${Date.now()}`,
+      headers: { 'Range': 'bytes=0-2047' },
+      // 跨域拉 raw 不能带 Cookie：对方允许源是 *，带凭据会被浏览器直接判 CORS 失败
+      credentials: 'omit',
+      timeout: 15000
+    });
+    const code = res && res.status;
+    if (!(code >= 200 && code < 300)) throw new Error(`拉取失败（HTTP ${code || 0}）`);
+    const text = String((res && res.responseText) || '').slice(0, 4096);
+    const m = text.match(/@version\s+([0-9][0-9.]*)/);
+    if (!m) throw new Error('远端脚本头里没有 @version');
+    return m[1];
+  }
+
+  function openInstallPage() {
+    try {
+      if (typeof GM_openInTab === 'function') {
+        GM_openInTab(RAW_URL, { active: true, insert: true });
+        return;
+      }
+    } catch (e) { /* ignore */ }
+    window.open(RAW_URL, '_blank', 'noopener');
+  }
+
+  function renderUpdateLine() {
+    const root = typeof getRoot === 'function' ? getRoot() : null;
+    const el = root && root.getElementById('yx-update-line');
+    if (!el) return;
+    const info = state.updateInfo;
+    if (info && info.has) {
+      el.innerHTML = `版本 v${APP.version} → <b style="color:#fbbf24">v${esc(info.latest)}</b> 可更新`;
+    } else if (info && info.has === false) {
+      el.textContent = `版本 v${APP.version} · 已是最新`;
+    } else {
+      el.textContent = `版本 v${APP.version} · 无口令 / 无授权码`;
+    }
+  }
+
+  async function checkUpdate(manual) {
+    if (manual) toastRootPush('正在检查更新…', 'info', 1200);
+    try {
+      const latest = await fetchRemoteVersion();
+      const has = cmpVersion(latest, APP.version) > 0;
+      state.updateInfo = { latest, has };
+      GMStore.set('yx_update', { t: Date.now(), latest, has });
+      renderUpdateLine();
+      if (has) {
+        toastRootPush(`${manual ? '' : '发现新版本 '}v${latest}（当前 v${APP.version}）`, 'warn', 6000);
+        if (manual && confirm(`发现新版本 v${latest}\n当前版本 v${APP.version}\n\n现在打开安装页覆盖更新？`)) {
+          openInstallPage();
+        }
+      } else if (manual) {
+        toastRootPush(`已是最新版本 v${APP.version}`);
+      }
+      return { latest, has };
+    } catch (e) {
+      if (manual) toastRootPush('检查更新失败：' + (e.message || e), 'err', 4200);
+      return null;
+    }
+  }
+
   function boot() {
     DL.restore();
     mountUI();
@@ -4415,6 +4556,13 @@
 
     // 只在分享页自动预解析
     if (detectPlatform(location.href)) preloadFor(location.href);
+
+    // 每 24 小时静默查一次新版：有更新才弹提示，没有就完全不打扰
+    try {
+      const up = GMStore.get('yx_update', {}) || {};
+      if (!up.t || Date.now() - Number(up.t) > 24 * 3600 * 1000) checkUpdate(false);
+      else if (up.latest) state.updateInfo = { latest: up.latest, has: !!up.has };
+    } catch (e) { /* ignore */ }
 
     window.addEventListener('beforeunload', () => DL.save());
 
