@@ -4536,7 +4536,9 @@
       }
       return { latest, has };
     } catch (e) {
-      if (manual) toastRootPush('检查更新失败：' + (e.message || e), 'err', 4200);
+      if (manual) {
+        toastRootPush(`检查更新失败：${e.message || e}｜raw 域名国内可能不通，可到项目主页手动下载`, 'err', 5200);
+      }
       return null;
     }
   }

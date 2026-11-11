@@ -39,6 +39,9 @@ https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%
 > `raw.githubusercontent.com` 在国内偶尔连不上。连不上就把 `@updateURL` / `@downloadURL` 换成镜像：
 > `https://gh.zjkl0330.dpdns.org/zjkl0330/tampermonkey/raw/main/js/%E4%BA%91%E6%9E%90%E7%9B%B4%E9%93%BE.user.js`
 > 或者直接重新下载覆盖安装，设置（含百度令牌）存在扩展里，不会丢。
+>
+> 注意：镜像会把文件里的 `github.com` 改写成自己的域，`@namespace` 跟着变，篡改猴可能提示「脚本已存在，是否覆盖」——点覆盖即可，仍然是一个脚本。
+> 镜像响应不带 `Access-Control-Allow-Origin`，所以**不能**当自动检查更新的数据源（浏览器会 CORS 拦掉），只能用来下载安装。
 
 ### 运行范围（v1.9.0 起收窄）
 
