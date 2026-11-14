@@ -20,7 +20,7 @@ https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%
 | 脚本 | 说明 | 文档 |
 | --- | --- | --- |
 | `js/github-proxy.user.js` | GitHub 访问优化 | — |
-| `js/云析直链.user.js` | 夸克 / UC / 123 / 115 / 天翼 / 移动 / 百度 / 迅雷 / 阿里 / 城通 网盘分享直链解析 | [docs/云析直链](docs/云析直链/README.md) |
+| `js/云析直链.user.js` | 夸克 / UC / 123 / 115 / 天翼 / 移动 / 百度 / 迅雷 / 阿里 / 城通 网盘直链解析（10 家分享页 + 6 家个人盘） | [docs/云析直链](docs/云析直链/README.md) |
 
 ## 文档
 
@@ -38,7 +38,16 @@ https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%
 js/                    用户脚本本体
 docs/<脚本名>/          使用文档 + 截图
 research/<主题-年月>/    研究过程、协议实录、探针脚本
+tests/yunx/            云析直链的 Playwright 冒烟用例（打桩，不碰真实账号）
 ```
+
+改完 `js/云析直链.user.js` 建议先跑一遍回归：
+
+```bash
+python3 tests/yunx/run_all.py --offline
+```
+
+CI 会在 push 时自动跑同样的 19 个离线用例（`.github/workflows/yunx-smoke.yml`）。
 
 ## License
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         云析直链 · 网盘直链下载助手
 // @namespace    https://github.com/CYQawa/YunX
-// @version      1.13.1
+// @version      1.14.0
 // @author       云析直链（YunX 移植）
 // @description  夸克 / UC / 123 / 115 / 天翼 / 移动 / 百度 / 迅雷 / 阿里 / 城通 网盘分享直链解析，附分享页去广告：自动列目录、8 线程分片下载、暂停续传，可导出 IDM / Aria2 / cURL 命令。无口令、无授权码，装上即用。
 // @license      AGPL-3.0-or-later
@@ -9,8 +9,7 @@
 // @supportURL   https://github.com/zjkl0330/tampermonkey/issues
 // @updateURL    https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%90%E7%9B%B4%E9%93%BE.user.js
 // @downloadURL  https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%90%E7%9B%B4%E9%93%BE.user.js
-// @match        https://pan.quark.cn/
-// @match        https://pan.quark.cn/s/*
+// @match        https://pan.quark.cn/*
 // @match        https://drive.uc.cn/*
 // @match        https://www.123865.com/s/*
 // @match        https://www.123pan.com/s/*
@@ -94,7 +93,7 @@
    * 0. 常量
    * ===================================================================== */
 
-  const APP = { name: '云析直链', version: '1.13.1' };
+  const APP = { name: '云析直链', version: '1.14.0' };
 
   // 夸克 PC 客户端 UA：列表 / 取链接口都校验它
   const UA_QUARK =
@@ -702,6 +701,154 @@
       return false;
     }
   });
+
+  /* ---------------- 夸克个人盘 ----------------
+   * 与 UC 是同一套 clouddrive 协议，只换域名（drive-pc.quark.cn）、pr（ucpro）和 UA。
+   * 分享页那套要 stoken / fids_token，个人盘只认登录态，所以单独一组 mine* 方法，
+   * 分享链路一个字没动（list/link 只在 ctx.mine 时分流）。
+   * 凭据同样是 HttpOnly 的 __puus，document.cookie 读不到，靠 GM_cookie。
+   */
+  const QUARK_MINE_PAGE = 100;
+
+  Object.assign(quark, {
+    pickMine(url) {
+      let u;
+      try { u = new URL(url); } catch (e) { return null; }
+      if (u.hostname !== 'pan.quark.cn') return null;
+      if (/^\/s\//.test(u.pathname)) return null;   // /s/xxx 是分享页
+      return { mine: true };
+    },
+
+    mineKey(cookie) {
+      const m = String(cookie || '').match(/__(?:puus|pus)=([^;]+)/);
+      return m ? m[1] : '';
+    },
+
+    mineHeaders(ctx) {
+      const h = {
+        'User-Agent': UA_QUARK,
+        'Origin': 'https://pan.quark.cn',
+        'Referer': 'https://pan.quark.cn/',
+        'Content-Type': 'application/json;charset=UTF-8'
+      };
+      if (ctx.cookie) h.Cookie = ctx.cookie;
+      return h;
+    },
+
+    mineError(json) {
+      const code = Number(json && json.code);
+      if (code === 31001 || Number(json && json.status) === 401) {
+        return new Error('夸克网盘登录态无效或已过期：请在 pan.quark.cn 重新登录，然后刷新本页');
+      }
+      if (code === 31023 || code === 31024) {
+        return new Error('夸克接口风控拦截，稍等几分钟再试，或换个网络');
+      }
+      return new Error(apiMessage(json, '夸克网盘接口返回异常'));
+    },
+
+    async mineInit(ctx) {
+      ctx.mine = true;
+      ctx.cookie = await cookieHeader('https://pan.quark.cn');
+      if (!this.mineKey(ctx.cookie)) {
+        ctx.authFailed = 'expired';
+        throw new Error('读不到夸克登录态：请先在 pan.quark.cn 登录，然后刷新本页（__puus 是 HttpOnly Cookie，手机浏览器可能读不到，建议用电脑版）');
+      }
+      ctx.title = '我的夸克网盘';
+      try {
+        const res = await gmRequest({
+          url: 'https://pan.quark.cn/account/info?fr=pc&platform=web',
+          headers: { 'User-Agent': UA_QUARK, 'Referer': 'https://pan.quark.cn/' }
+        });
+        const j = parseJSON(res, '校验夸克登录态失败');
+        const d = (j && j.data) || {};
+        const nick = d.nickname || d.nick_name || '';
+        if (nick) { ctx.nick = nick; ctx.title = nick; }
+      } catch (e) { /* ignore */ }
+      ctx.logged = true;
+    },
+
+    async mineList(ctx, dirId) {
+      const out = [];
+      const seen = new Set();
+      const pdir = String(dirId || '0') || '0';
+      for (let page = 1; page <= 50; page++) {
+        const qs = new URLSearchParams({
+          pr: 'ucpro',
+          fr: 'pc',
+          pdir_fid: pdir,
+          force: '0',
+          _page: String(page),
+          _size: String(QUARK_MINE_PAGE),
+          _fetch_total: '1',
+          _fetch_sub_dirs: '0',
+          _sort: 'file_type:asc,updated_at:desc'
+        });
+        const res = await gmRequest({
+          url: `https://drive-pc.quark.cn/1/clouddrive/file/sort?${qs.toString()}`,
+          headers: this.mineHeaders(ctx)
+        });
+        const j = parseJSON(res, '读取夸克网盘目录失败');
+        if (Number(j.status) !== 200) throw this.mineError(j);
+        const d = j.data || {};
+        const arr = d.list || [];
+        for (const it of arr) {
+          const fid = String(it.fid || '');
+          if (!fid || seen.has(fid)) continue;
+          seen.add(fid);
+          out.push({
+            fid,
+            name: it.file_name || '未命名',
+            size: Number(it.size || 0),
+            dir: !!it.dir,
+            token: ''
+          });
+        }
+        if (arr.length < QUARK_MINE_PAGE) break;
+        await sleep(80);
+      }
+      return out;
+    },
+
+    async mineLink(ctx, file) {
+      const res = await gmRequest({
+        method: 'POST',
+        url: 'https://drive-pc.quark.cn/1/clouddrive/file/download?pr=ucpro&fr=pc&sys=win32&ve=3.23.2',
+        headers: this.mineHeaders(ctx),
+        data: JSON.stringify({ fids: [String(file.fid)] })
+      });
+      const j = parseJSON(res, '获取夸克直链失败');
+      if (Number(j.status) !== 200) throw this.mineError(j);
+
+      const pug = pickCookie(res, '__puus');
+      if (pug) {
+        const val = pug.slice(pug.indexOf('=') + 1);
+        if (/__puus=/.test(ctx.cookie)) ctx.cookie = ctx.cookie.replace(/__puus=[^;]*/g, `__puus=${val}`);
+        else ctx.cookie += `; __puus=${val}`;
+      }
+
+      const it = (j.data && j.data[0]) || {};
+      const url = it.download_url;
+      if (!url) throw new Error('夸克没返回直链，可能触发风控或当日流量已用尽');
+      return {
+        url,
+        headers: { 'User-Agent': UA_QUARK, 'Referer': 'https://pan.quark.cn/' },
+        guest: false,
+        filename: it.file_name || file.name,
+        size: Number(it.size || file.size || 0)
+      };
+    }
+  });
+
+  const quarkShareList = quark.list.bind(quark);
+  const quarkShareLink = quark.link.bind(quark);
+  quark.list = function (ctx, dirId) {
+    if (ctx && ctx.mine) return this.mineList(ctx, dirId);
+    return quarkShareList(ctx, dirId);
+  };
+  quark.link = function (ctx, file) {
+    if (ctx && ctx.mine) return this.mineLink(ctx, file);
+    return quarkShareLink(ctx, file);
+  };
 
   const uc = makeCloudDrive({
     id: 'uc',
@@ -3372,7 +3519,7 @@
       ? state.platform
       : PLATFORMS.find((x) => x && x.pickMine && x.pickMine(location.href));
     if (!p || !p.pickMine) {
-      toastRootPush('当前页面不是已支持的个人网盘（123 / 迅雷 / 百度 / UC / 城通）', 'warn', 4500);
+      toastRootPush('当前页面不是已支持的个人网盘（123 / 迅雷 / 百度 / UC / 夸克 / 城通）', 'warn', 4500);
       return;
     }
     const ctx = { mine: true, id: '', pwd: '', title: '', logged: false };
@@ -3382,10 +3529,12 @@
     ];
     try {
       if (p.id === 'pan123') ctx.base = 'https://yun.123pan.cn';
-      if (p.id === 'uc') {
-        ctx.cookie = await cookieHeader('https://drive.uc.cn');
+      if (p.id === 'uc' || p.id === 'quark') {
+        const origin = p.id === 'uc' ? 'https://drive.uc.cn' : 'https://pan.quark.cn';
+        const label = p.id === 'uc' ? 'uc' : '夸克';
+        ctx.cookie = await cookieHeader(origin);
         const key = p.mineKey ? p.mineKey(ctx.cookie) : '';
-        lines.push(`__puus：${key ? '有（' + key.length + ' 字符）' : '没有，说明当前浏览器没登录 uc'}`);
+        lines.push(`__puus：${key ? '有（' + key.length + ' 字符）' : '没有，说明当前浏览器没登录 ' + label}`);
       } else if (p.id === 'ctfile') {
         const rt = ctCookie('ctfile_session');
         let st = '';
@@ -4266,6 +4415,51 @@
     toastRootPush(ok ? `已复制 ${targets.length} 条` : '复制失败', ok ? 'ok' : 'err');
   }
 
+  /* 批量下载：把勾选的文件依次推进下载队列。
+   * 取链一条一条来（间隔 600ms，避免触发频控），但下载本身不排队等完成——
+   * 已启动的任务交给 DL 自己调度，多任务时它会自动平分线程，不会一口气铺满连接。
+   * 浏览器直下模式（手机 / 无 GM 环境）必须一个一个触发，否则会被当成弹窗拦掉。
+   */
+  let batchRunning = false;
+  async function downloadSelected() {
+    const targets = state.items.filter((i) => !i.dir && state.selected.has(i.fid));
+    if (!targets.length) {
+      toastRootPush('请先勾选要下载的文件（文件夹请先点进去）', 'warn');
+      return;
+    }
+    if (batchRunning) {
+      toastRootPush('上一批还在启动中，稍等一下', 'warn');
+      return;
+    }
+    if (targets.length > 20) {
+      toastRootPush(`一次最多 20 个（当前勾了 ${targets.length} 个），更多的请用「导出 Aria2」`, 'warn', 5000);
+      return;
+    }
+    const browserMode = settings.downloadMode === 'browser'
+      || (settings.downloadMode === 'auto' && (IS_MOBILE || !HAS_GM_XHR));
+    batchRunning = true;
+    toastRootPush(`正在获取 ${targets.length} 个文件的直链…`, 'info', 4000);
+    let ok = 0;
+    let fail = 0;
+    let lastErr = '';
+    for (const it of targets) {
+      try {
+        await resolveLink(it);
+        if (browserMode) await openInTab(it);
+        else DL.start(it).catch(() => {});
+        ok++;
+      } catch (e) {
+        fail++;
+        lastErr = e.message || String(e);
+      }
+      await sleep(browserMode ? 900 : 600);
+    }
+    batchRunning = false;
+    if (!ok) toastRootPush(`一个都没取到：${lastErr || '未知原因'}`, 'err', 5000);
+    else if (fail) toastRootPush(`已加入 ${ok} 个，${fail} 个取链失败：${lastErr}`, 'warn', 5000);
+    else toastRootPush(`已加入下载队列 ${ok} 个`, 'ok', 4000);
+  }
+
   async function exportAria2() {
     const targets = state.items.filter((i) => !i.dir);
     if (!targets.length) {
@@ -4378,6 +4572,12 @@
       font-size: 12px; outline: none; color: #0f172a; background: #fbfcfe;
     }
     .search:focus { border-color: var(--acc, #1e6fff); background: #fff; }
+    /* 窄屏：五个批量按钮占满一行后，搜索框单独一行，别把按钮挤成两截 */
+    @media (max-width: 560px) {
+      .bar { padding: 10px 12px; gap: 6px; }
+      .bar .search { flex: 1 1 100%; width: auto; }
+      .bar .btn { padding: 0 9px; }
+    }
 
     .crumb { display: flex; align-items: center; gap: 6px; padding: 8px 18px; font-size: 12px; color: #64748b; border-bottom: 1px solid #f1f5f9; }
     .crumb a { color: var(--acc, #1e6fff); cursor: pointer; }
@@ -4697,8 +4897,9 @@
       const isXL = /(^|\.)xunlei\.com$/.test(host);
       const isBD = host === 'pan.baidu.com';
       const isUC = host === 'drive.uc.cn';
+      const isQuark = host === 'pan.quark.cn';
       const isCT = host === 'my.ctfile.com';
-      if (!is123 && !isXL && !isBD && !isUC && !isCT) return;
+      if (!is123 && !isXL && !isBD && !isUC && !isQuark && !isCT) return;
       const w = (typeof unsafeWindow !== 'undefined' && unsafeWindow) || window;
       // 城通是 hash 路由（#folder=d123），不靠请求参数，直接听 hashchange 更稳
       if (isCT) {
@@ -4720,7 +4921,7 @@
         if (/[?&]access_token=/.test(s)) return;
         const m123 = s.match(/[?&]parentFileId=(\d+)/);
         if (m123) { pageMineDir = m123[1]; return; }
-        if (isUC && /\/1\/clouddrive\/file\/sort(\?|$)/.test(s)) {
+        if ((isUC || isQuark) && /\/1\/clouddrive\/file\/sort(\?|$)/.test(s)) {
           const mu = s.match(/[?&]pdir_fid=([A-Za-z0-9_-]*)/);
           if (mu) pageMineDir = mu[1] || '0';
           return;
@@ -4841,6 +5042,7 @@
         <div class="bar" id="yx-bar">
           <button class="btn" id="yx-select-all">全选</button>
           <button class="btn primary" id="yx-copy-sel">复制已选</button>
+          <button class="btn" id="yx-dl-sel">下载已选</button>
           <button class="btn" id="yx-export">导出 Aria2</button>
           <button class="btn" id="yx-refresh">刷新</button>
           <div class="spacer"></div>
@@ -5098,6 +5300,7 @@
       else openPanel();
     });
     on('yx-copy-sel', 'click', copySelected);
+    on('yx-dl-sel', 'click', downloadSelected);
     on('yx-select-all', 'click', selectAll);
     on('yx-export', 'click', exportAria2);
 
@@ -5419,7 +5622,7 @@
     }
 
     // 没有解析结果时，批量操作不可点
-    ['yx-select-all', 'yx-copy-sel', 'yx-export', 'yx-refresh'].forEach((id) => {
+    ['yx-select-all', 'yx-copy-sel', 'yx-dl-sel', 'yx-export', 'yx-refresh'].forEach((id) => {
       const b = root.getElementById(id);
       if (b) b.disabled = !state.ctx;
     });

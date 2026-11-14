@@ -55,13 +55,13 @@ https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%
 > 注意：镜像会把文件里的 `github.com` 改写成自己的域，`@namespace` 跟着变，篡改猴可能提示「脚本已存在，是否覆盖」——点覆盖即可，仍然是一个脚本。
 > 镜像响应不带 `Access-Control-Allow-Origin`，浏览器跨域读不了，所以**不能**当自动检查更新的数据源。
 
-### 运行范围（v1.9.0 收窄，v1.13.0 起 123 / 迅雷 / 百度 / UC / 城通 个人盘也接管）
+### 运行范围（v1.9.0 收窄，v1.14.0 起 123 / 迅雷 / 百度 / UC / 夸克 / 城通 个人盘也接管）
 
 早期版本是「域名级全站匹配」，连会员页、支付页都会挂悬浮球。现在只在**分享页**和**已支持的个人网盘**注入：
 
 | 平台 | 启用的路径 |
 | --- | --- |
-| 夸克 | `pan.quark.cn/`、`pan.quark.cn/s/*` |
+| 夸克（分享 + 个人盘） | `pan.quark.cn/*`（`/s/*` 走分享，其余走个人盘，v1.14.0） |
 | UC（分享 + 个人盘） | `drive.uc.cn/*`（`/s/*` 走分享，其余走个人盘，v1.13.0） |
 | 123 云盘（分享） | `www.123865.com/s/*`、`www.123pan.com/s/*`、`www.123pan.cn/s/*`、`share.123pan.cn/123pan/*` |
 | 123 云盘（个人盘） | `yun.123pan.cn/*`、`yun.123pan.com/*`、`www.123865.com/*`（登录后的盘，v1.10.0） |
@@ -96,20 +96,21 @@ https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%
 
 面板里手动改过选择后，页面同步会暂停，不会把你刚改的覆盖掉；关掉重开面板会重新对齐。
 
-### 个人网盘：123 / 迅雷 / 百度 / UC / 城通（v1.10.0 ~ v1.13.1）
+### 个人网盘：123 / 迅雷 / 百度 / UC / 夸克 / 城通（v1.10.0 ~ v1.14.0）
 
-之前只在**分享页**干活，自己盘里的文件读不到。现在这五家的登录后页面也接管了：
+之前只在**分享页**干活，自己盘里的文件读不到。现在这六家的登录后页面也接管了：
 
-| 动作 | 123 云盘 | 迅雷云盘 | 百度网盘 | UC 网盘 | 城通网盘 |
-| --- | --- | --- | --- | --- | --- |
-| 页面 | `yun.123pan.cn` | `pan.xunlei.com` | `pan.baidu.com/disk/main` | `drive.uc.cn` | `my.ctfile.com` |
-| 面板标题 | 你的昵称 | 「我的迅雷云盘」 | 你的百度昵称 | 你的 UC 昵称 | 你的城通昵称 |
-| 列目录 / 下钻 / 返回 | ✅ | ✅ | ✅ | ✅ | ✅ |
-| 页面勾选 → 面板同步 | ✅ | ✅ | ✅ | ✅ | ✅ |
-| 跟随页面所在目录 | ✅ `parentFileId` | ✅ `parent_id` | ✅ `/api/list` 的 `dir` | ✅ `pdir_fid` | ✅ hash `#folder=` |
-| 下载 / 复制直链 | ✅ | ✅ | ✅（有令牌时自动走分片引擎） | ✅ | ✅（会员走直连，免费号回退分享解析） |
-| 刷新当前目录 | ✅ | ✅ | ✅ | ✅ | ✅ |
-| 需要额外授权 | 否（读网页登录态） | 否（读网页登录态） | **是**，点「一键授权百度网盘」 | 否（读网页 Cookie） | 否（读网页 Cookie） |
+| 动作 | 123 云盘 | 迅雷云盘 | 百度网盘 | UC 网盘 | 夸克网盘 | 城通网盘 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 页面 | `yun.123pan.cn` | `pan.xunlei.com` | `pan.baidu.com/disk/main` | `drive.uc.cn` | `pan.quark.cn` | `my.ctfile.com` |
+| 面板标题 | 你的昵称 | 「我的迅雷云盘」 | 你的百度昵称 | 你的 UC 昵称 | 你的夸克昵称 | 你的城通昵称 |
+| 列目录 / 下钻 / 返回 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 页面勾选 → 面板同步 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 跟随页面所在目录 | ✅ `parentFileId` | ✅ `parent_id` | ✅ `/api/list` 的 `dir` | ✅ `pdir_fid` | ✅ `pdir_fid` | ✅ hash `#folder=` |
+| 下载 / 复制直链 | ✅ | ✅ | ✅（有令牌时自动走分片引擎） | ✅ | ✅ | ✅（会员走直连，免费号回退分享解析） |
+| 批量下载已选 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 刷新当前目录 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 需要额外授权 | 否（读网页登录态） | 否（读网页登录态） | **是**，点「一键授权百度网盘」 | 否（读网页 Cookie） | 否（读网页 Cookie） | 否（读网页 Cookie） |
 
 取链走的接口：
 
@@ -119,9 +120,12 @@ https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%
 | 迅雷 | `drive/v1/files?parent_id=…` | `drive/v1/files/{id}?_magic=2021&usage=PLAY` | `localStorage.credentials_<client_id>.access_token` |
 | 百度 | `xpan/file?method=list&dir=…` | `xpan/multimedia?method=filemetas&dlink=1&fsids=[…]` | 「一键授权」拿到的 access_token（30 天） |
 | UC | `pc-api.uc.cn/1/clouddrive/file/sort?pdir_fid=…` | `POST /1/clouddrive/file/download`（只传 `fids`） | Cookie `__puus`（HttpOnly，靠 `GM_cookie` 读） |
+| 夸克 | `drive-pc.quark.cn/1/clouddrive/file/sort?pdir_fid=…` | `POST /1/clouddrive/file/download`（只传 `fids`） | Cookie `__puus`（同上，域名 `quark.cn`） |
 | 城通 | `POST api.ctfile.com/v4/file/browse/list` | `POST /v4/file/browse/direct-link` | 网页 Cookie `ctfile_session` → 换 900 秒 access token |
 
-UC 和夸克的分享页共用一套 `clouddrive` 协议，个人盘只是换了两条路径：`file/sort` 列目录、`file/download` 传纯 `fids`（分享页那套要 `fids_token` + `stoken`，个人盘不要）。所以 UC 的代码是在分享适配器上加了 `mine*` 分支，分享链路一个字没动。
+UC 和夸克的分享页共用一套 `clouddrive` 协议，个人盘只是换了两条路径：`file/sort` 列目录、`file/download` 传纯 `fids`（分享页那套要 `fids_token` + `stoken`，个人盘不要）。所以两家的代码都是在分享适配器上加了一组 `mine*` 分支，**分享链路一个字没动**——`list` / `link` 只在 `ctx.mine` 为真时分流。
+
+夸克和 UC 的差异只有三处：接口域（`drive-pc.quark.cn` vs `pc-api.uc.cn`）、`pr` 参数（`ucpro` vs `UCBrowser`）、UA。v1.14.0 补夸克时基本是把 UC 那套搬过来改这三处，所以两家的坑是共通的：`__puus` 是 HttpOnly，手机浏览器读不到就得靠 `GM_cookie`。
 
 城通这边要说明白：新版个人盘（`my.ctfile.com`）是 React SPA，接口全在 `api.ctfile.com/v4/*`，`Bearer` 鉴权。脚本用 Cookie 里的 `ctfile_session`（refresh token）去换 access token，**`rotate_token` 传 `false`**，不轮换、不把你自己浏览器里的登录态顶掉。直链是会员功能（标准会员起），免费号会 403 —— 这时脚本回退到「拼出 `f/<file_id>-<userid>` 分享地址 → 走已验证的分享解析」，也就是免费通道（限速 30KB/s，多连接分片加速）。
 
@@ -174,8 +178,12 @@ sessionStorage.token：有（312 字符）
 >
 > v1.13.1 顺手修了窄屏（手机）下列表把文件名挤成只剩图标的问题：给文件名补 `min-width:0` 让省略号生效，并在 ≤470px 时收窄大小列和按钮内边距。四个老平台的个人盘一起受益。
 >
-> **这两家的验证程度**：接口路径、参数名、返回字段都是从对方线上前端 chunk 里逐个核出来的（UC 的 `clouddrive` 协议、城通的 `v4/*` + `fileApi` chunk），再用 Playwright 伪造页面 + 打桩接口跑通「挂载 → 列目录 → 下钻 → 返回 → 勾选 → 取链 → 目录跟随 → 未登录提示 → 直链被拒回退」全流程。
-> 没有真实账号令牌跑过，所以真实回包的分页字段、免费号限速、城通 `userid` 是否稳定下发这三项仍是**未闭环**；真遇到对不上的，用「🔍 诊断当前网盘」把输出发我，按实际回包改。
+> **验证程度**：这几家的接口路径、参数名、返回字段都是从对方线上前端 chunk / 实际请求里逐个核出来的（UC 与夸克的 `clouddrive` 协议、城通的 `v4/*` + `fileApi` chunk），再用 Playwright 伪造页面 + 打桩接口跑通「挂载 → 列目录 → 下钻 → 返回 → 勾选 → 取链 → 目录跟随 → 未登录提示 → 直链被拒回退」全流程。
+> 这些用例已经入库（`tests/yunx/`，21 个场景，`python3 tests/yunx/run_all.py` 一键跑），push 时 GitHub Actions 会自动跑离线那 19 个。
+>
+> 仍然**没有真实账号令牌跑过**，所以真实回包的分页字段、免费号限速、城通 `userid` 是否稳定下发、百度 `dlink` 8 小时过期后的续取，这几项是未闭环的；真遇到对不上的，用「🔍 诊断当前网盘」把输出发我，按实际回包改。
+>
+> **v1.14.0 补的两件**：夸克个人盘（`pan.quark.cn` 全站接管，与 UC 同构）；批量「下载已选」（取链一条一条来、下载交给队列调度，一次上限 20 个，超了提示改用导出 Aria2）。
 
 ### 登录态怎么认（v1.9.2）
 
@@ -191,6 +199,7 @@ sessionStorage.token：有（312 字符）
 | 复制 | 把直链写入剪贴板（可在设置里改成 Aria2 / cURL / IDM 命令） |
 | ⋯ | 复制直链 / **IDM 命令** / Aria2 命令 / cURL 命令 / 浏览器打开 / 复制文件名 / 暂停 / 继续 / 取消并清理缓存 |
 | 全选 + 复制已选 | 批量取链（间隔 220ms，避免触发频控） |
+| 全选 + 下载已选 | 批量下载（v1.14.0）：取链间隔 600ms，启动后交给下载队列自己调度；一次最多 20 个，更多请用「导出 Aria2」 |
 | 导出 Aria2 | 生成带 `--header` 的脚本，Aria2 直接 `sh` 或粘进命令行 |
 | ⇄ | 解析其它链接（也能直接粘整段分享文案，自动识别提取码） |
 | ⚙ | 设置：自动解析、悬浮球、页面按钮接管、复制内容、下载方式、**并发连接数** |
@@ -247,6 +256,7 @@ sessionStorage.token：有（312 字符）
 | 平台 | 列目录 | 取直链 | 说明 |
 | --- | --- | --- | --- |
 | 夸克网盘 `pan.quark.cn/s/xxx` | ✅ 游客 | ✅ 游客 | 列表 → 取链 → Range 分片，端到端跑通（含文件夹分享） |
+| 夸克个人盘 `pan.quark.cn/` | ✅ 登录后直接列自己的文件 | ✅ 支持 | `file/sort` + `file/download`（只传 `fids`），与 UC 同构，凭据 `__puus` |
 | UC 网盘 `drive.uc.cn/s/xxx` | ✅ 游客 | ✅ 游客 | 取链后 CDN 200，`Content-Length` 与文件大小一致 |
 | 123 云盘 `123865.com/s/xxx` 等 | ✅ 匿名 | ⚠️ 需登录 | 匿名列表可读；下载接口统一返回 `5112 您需要注册登录或付费后下载`，登录后从 `localStorage.authorToken` 自动取 |
 | 115 网盘 `115.com/s/swxxx` | ✅ 游客 | ⚠️ 需登录 | `share/snap` 游客可用；`share/downurl` 游客返回 `990001 登录超时` |
@@ -533,7 +543,7 @@ v1.9.1 起球可以**按住拖动**，松手自动吸附到左边或右边，位
 新版挂载时会清掉页面上多余的实例，但脚本管理器里的那份要自己去删。
 
 **为什么网盘首页没有悬浮球了？**
-v1.9.0 起只在分享页注入（`/s/…`、`/t/…`、`/f/…`），会员页不再运行。v1.10.0 放开 123 个人盘，v1.11.0 放开迅雷个人盘（并把登录页从排除项里拿掉，未登录也能看到球和提示），v1.12.0 放开百度个人盘，v1.13.0 放开 UC（`drive.uc.cn`）和城通（`my.ctfile.com`）个人盘；夸克 / 阿里 / 115 / 天翼 / 移动的个人盘仍然不接管——要解析分享链接，直接打开分享页即可。
+v1.9.0 起只在分享页注入（`/s/…`、`/t/…`、`/f/…`），会员页不再运行。v1.10.0 放开 123 个人盘，v1.11.0 放开迅雷个人盘（并把登录页从排除项里拿掉，未登录也能看到球和提示），v1.12.0 放开百度个人盘，v1.13.0 放开 UC（`drive.uc.cn`）和城通（`my.ctfile.com`）个人盘，v1.14.0 放开夸克（`pan.quark.cn`）；阿里 / 115 / 天翼 / 移动的个人盘仍然不接管——要解析分享链接，直接打开分享页即可。
 
 **检查更新报「拉取失败 / 网络不通」？**
 v1.9.3 起会自动按 `raw → ghproxy.net → ghfast.top → jsDelivr` 依次重试，四个全挂才会报错，报错里会带上每个源各自的原因。
@@ -550,7 +560,7 @@ v1.9.0 把 `@connect` 从 `*` 收紧成了具体 CDN 列表。碰到没列进去
 | 登录态 | App 内 WebView 登录 | 复用浏览器当前站点的 Cookie / localStorage |
 | 取链方式 | 游客 / 免转存 / 转存兜底 | 游客 + 免转存（不写你的网盘） |
 | 下载 | 内置 Range 分片、断点续传 | 内置 OPFS 分片 + 断点续传，也可导出给 IDM / Aria2 |
-| 平台数量 | 10 个网盘 + 7 个视频站 | 9 个网盘（夸克 / UC / 123 / 115 / 天翼 / 移动 / 百度 / 迅雷 / 阿里） |
+| 平台数量 | 10 个网盘 + 7 个视频站 | 10 家网盘（夸克 / UC / 123 / 115 / 天翼 / 移动 / 百度 / 迅雷 / 阿里 / 城通），其中 6 家可读个人盘；视频站不做 |
 
 ## 十、免责声明
 

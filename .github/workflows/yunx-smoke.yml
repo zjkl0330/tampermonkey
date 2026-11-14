@@ -1,0 +1,38 @@
+name: yunx smoke
+
+# 只在这个脚本或其用例变化时跑，别让整个仓库的提交都被拖住
+on:
+  push:
+    paths:
+      - 'js/云析直链.user.js'
+      - 'tests/yunx/**'
+      - '.github/workflows/yunx-smoke.yml'
+  pull_request:
+    paths:
+      - 'js/云析直链.user.js'
+      - 'tests/yunx/**'
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装 Playwright 与 Chromium
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright
+          python -m playwright install --with-deps chromium
+
+      - name: 语法检查
+        run: |
+          node --check "js/云析直链.user.js"
+
+      - name: 跑冒烟用例（离线）
+        run: python tests/yunx/run_all.py --offline
