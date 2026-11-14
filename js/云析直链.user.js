@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         云析直链 · 网盘直链下载助手
 // @namespace    https://github.com/CYQawa/YunX
-// @version      1.9.1
+// @version      1.9.2
 // @author       云析直链（YunX 移植）
 // @description  夸克 / UC / 123 / 115 / 天翼 / 移动 / 百度 / 迅雷 / 阿里 / 城通 网盘分享直链解析，附分享页去广告：自动列目录、8 线程分片下载、暂停续传，可导出 IDM / Aria2 / cURL 命令。无口令、无授权码，装上即用。
 // @license      AGPL-3.0-or-later
@@ -86,7 +86,7 @@
    * 0. 常量
    * ===================================================================== */
 
-  const APP = { name: '云析直链', version: '1.9.1' };
+  const APP = { name: '云析直链', version: '1.9.2' };
 
   // 夸克 PC 客户端 UA：列表 / 取链接口都校验它
   const UA_QUARK =
@@ -507,6 +507,12 @@
         ctx.cookie = await cookieHeader(cfg.origin);
         ctx.logged = /(__pus=|__puus=)/.test(ctx.cookie);
 
+        // Cookie 里读不到登录态时（__puus 是 HttpOnly，手机浏览器基本读不到），
+        // 会出现「已经登录了，面板还显示游客」。这里再用接口探一次真实状态。
+        const probe = (!ctx.logged && typeof cfg.probeLogin === 'function')
+          ? cfg.probeLogin(ctx, baseHeaders).catch(() => false)
+          : null;
+
         const res = await gmRequest({
           method: 'POST',
           url: cfg.tokenUrl,
@@ -525,6 +531,10 @@
         ctx.stoken = d.stoken || '';
         ctx.title = d.title || '';
         if (!ctx.stoken) throw new Error('分享凭证获取失败（stoken 为空）');
+
+        if (probe) {
+          try { if (await probe) ctx.logged = true; } catch (e) { /* ignore */ }
+        }
       },
 
       async list(ctx, dirId) {
@@ -658,7 +668,31 @@
     tokenUrl: 'https://drive-pc.quark.cn/1/clouddrive/share/sharepage/token?pr=ucpro&fr=pc',
     detailUrl: 'https://drive-pc.quark.cn/1/clouddrive/share/sharepage/detail',
     detailMode: 'get',
-    downloadUrl: 'https://drive-pc.quark.cn/1/clouddrive/file/download?pr=ucpro&fr=pc&sys=win32&ve=3.23.2'
+    downloadUrl: 'https://drive-pc.quark.cn/1/clouddrive/file/download?pr=ucpro&fr=pc&sys=win32&ve=3.23.2',
+
+    // 登录态兜底探测：Cookie 读不到 HttpOnly 的 __puus 时靠接口判断
+    async probeLogin(ctx, baseHeaders) {
+      // ① 同源接口，最轻：登录后 data 里有 nickname / user_id
+      try {
+        const r = await gmRequest({ url: 'https://pan.quark.cn/account/info?fr=pc&platform=web', timeout: 8000 });
+        const j = JSON.parse(String((r && r.responseText) || '{}'));
+        const d = j.data || {};
+        if (d.nickname || d.user_id || d.passport || d.member_type) {
+          ctx.nick = d.nickname || '';
+          return true;
+        }
+      } catch (e) { /* ignore */ }
+      // ② 会员接口兜底：未登录返回 401 / code 31001 require login [guest]
+      try {
+        const r = await gmRequest({
+          url: 'https://drive-pc.quark.cn/1/clouddrive/member?pr=ucpro&fr=pc',
+          headers: baseHeaders(''),
+          timeout: 8000
+        });
+        if (Number(r && r.status) === 200) return true;
+      } catch (e) { /* ignore */ }
+      return false;
+    }
   });
 
   const uc = makeCloudDrive({
@@ -2450,6 +2484,9 @@
     error: '',
     filter: '',
     shareUrl: '',
+    navLock: false,     // 用户在面板里手动进过目录后，不再跟随页面的目录变化
+    selFromPage: false, // 当前选中是否来自页面勾选同步
+    pageSelDirty: false, // 用户在面板里手动改过选择，别再被页面同步覆盖
     more: null,         // {fid, x, y}
     settingsOpen: false
   };
@@ -2557,6 +2594,8 @@
 
   async function enterDir(item) {
     if (!state.platform || !state.ctx) return;
+    state.navLock = true;   // 用户自己在面板里导航了，别再被页面目录拉走
+    state.pageSelDirty = false;
     state.loading = true;
     state.error = '';
     render();
@@ -2575,6 +2614,8 @@
 
   async function backDir() {
     if (state.stack.length <= 1) return;
+    state.navLock = true;
+    state.pageSelDirty = false;
     state.stack.pop();
     const top = state.stack[state.stack.length - 1];
     state.loading = true;
@@ -3585,6 +3626,196 @@
     .more-menu button.danger:hover { background: #fef2f2; }
   `;
 
+  /* =======================================================================
+   * 5.9 页面联动：跟随页面当前目录 + 同步页面勾选
+   * -----------------------------------------------------------------------
+   * 用户更习惯直接在网盘页面上操作：点进文件夹、勾上文件。
+   * 面板要是各走各的，就会出现「页面已经在文件夹里，面板还停在根目录」。
+   *
+   * 夸克进文件夹既不换 URL、也不重新请求（数据首屏就拿到了），所以拿不到 pdir_fid。
+   * 这里的做法是拿「页面上正在显示的文件名」当锚点：
+   *   ① 面板当前层没有这些名字 → 逐层往下翻，翻到哪层对得上就切过去
+   *   ② 监听页面勾选，按文件名匹配回面板条目，同步成面板的选中态
+   *      点球打开就能直接下载 / 复制直链
+   * ===================================================================== */
+
+  let lastFollowAt = 0;
+
+  // 页面上当前看得见的文件名（手机是 .item-tit，桌面是表格第二列 / title）
+  function pageVisibleNames() {
+    const set = new Set();
+    const push = (t) => {
+      const s = String(t || '').replace(/\s+/g, ' ').trim();
+      if (s && s.length < 120) set.add(s);
+    };
+    try {
+      document.querySelectorAll('.file-item .item-tit').forEach((el) => push(el.textContent));
+      document.querySelectorAll('tr.ant-table-row').forEach((tr) => {
+        const t = tr.querySelector('[title]');
+        if (t) { push(t.getAttribute('title')); return; }
+        const td = tr.querySelectorAll('td');
+        if (td.length > 1) push(td[1].textContent);
+      });
+      document.querySelectorAll('.file-item .item-tit[title]').forEach((el) => push(el.getAttribute('title')));
+    } catch (e) { /* ignore */ }
+    return Array.from(set);
+  }
+
+  function layerHit(items, names) {
+    if (!items || !items.length || !names || !names.length) return false;
+    const set = new Set(items.map((i) => String(i.name || '').replace(/\s+/g, ' ').trim()));
+    let hit = 0;
+    for (const n of names) if (set.has(n)) hit++;
+    return hit >= Math.min(2, names.length);
+  }
+
+  // 按页面上的显示顺序排一遍，免得面板顺序和用户刚看到的对不上
+  function orderLikePage(items, names) {
+    if (!items || !names || !names.length) return items;
+    const idx = new Map();
+    names.forEach((n, i) => idx.set(n, i));
+    return items.slice().sort((a, b) => {
+      const ia = idx.has(a.name) ? idx.get(a.name) : 9999;
+      const ib = idx.has(b.name) ? idx.get(b.name) : 9999;
+      return ia - ib;
+    });
+  }
+
+  // 页面进到了子目录 → 面板跟着切过去。
+  // 夸克进文件夹不发请求、URL 也不变，只能靠「页面上正在显示哪些文件名」反推层级：
+  // 在当前层找不到，就逐层往下翻，命中即切（最多翻 12 个目录，避免请求风暴）。
+  async function followPageDir(force) {
+    if (!state.ctx || !state.platform) return false;
+    if (state.navLock && !force) return false;
+    if (Date.now() - lastFollowAt < 1200) return false;
+
+    const names = pageVisibleNames();
+    if (!names.length) return false;
+    if (layerHit(state.items, names)) return false;   // 已经在同一层
+    if (!state.items.some((i) => i.dir)) return false; // 当前层没有可下去的文件夹
+
+    lastFollowAt = Date.now();
+    const tried = new Set();
+    const queue = state.items.filter((i) => i.dir).map((i) => ({
+      id: i.fid,
+      path: [{ id: '0', name: '根目录' }, { id: i.fid, name: i.name }]
+    }));
+    let budget = 12;
+
+    while (queue.length && budget-- > 0) {
+      const node = queue.shift();
+      if (!node || tried.has(node.id)) continue;
+      tried.add(node.id);
+      let list = null;
+      try { list = await state.platform.list(state.ctx, node.id); } catch (e) { continue; }
+      if (layerHit(list, names)) {
+        state.items = orderLikePage(list, names);
+        state.stack = node.path;
+        state.selected.clear();
+        state.selFromPage = false;
+        if (state.open) render();
+        return true;
+      }
+      list.filter((i) => i.dir).forEach((i) => queue.push({
+        id: i.fid,
+        path: node.path.concat([{ id: i.fid, name: i.name }])
+      }));
+      if (queue.length > 60) break;
+    }
+    return false;
+  }
+
+  function inOurUI(el) {
+    try { return !!(el && el.closest && el.closest('[id^="yunx-panlink"]')); } catch (e) { return false; }
+  }
+
+  // 页面上当前勾选了哪些行（手机是 .file-item，桌面是 antd 表格行）
+  function pageCheckedRows() {
+    const rows = [];
+    let all = false;
+    try {
+      Array.from(document.querySelectorAll('input[type=checkbox]:checked')).forEach((cb) => {
+        if (inOurUI(cb)) return;
+        const row = cb.closest('.file-item, tr.ant-table-row, .ant-table-row, [class*="file-row"], [class*="fileRow"]');
+        if (row && !inOurUI(row)) { rows.push(row); return; }
+        // 落在表头 / 全选位置的勾选框 → 视为全选
+        const head = cb.closest('thead, [class*="header"], [class*="Header"]');
+        if (head) all = true;
+      });
+      Array.from(document.querySelectorAll('.ant-table-row-selected, .file-item.selected, .file-item.checked')).forEach((r) => {
+        if (!inOurUI(r) && rows.indexOf(r) < 0) rows.push(r);
+      });
+    } catch (e) { /* ignore */ }
+    return { all, rows };
+  }
+
+  function setBallBadge(n) {
+    const root = getRoot();
+    if (!root) return;
+    const badge = root.getElementById('yx-badge');
+    if (!badge) return;
+    badge.textContent = n > 0 ? String(n) : '';
+    badge.classList.toggle('on', n > 0);
+  }
+
+  // 把页面上的勾选同步成面板的选中态
+  function syncPageSelection() {
+    if (!state.ctx || !state.items.length) return;
+    if (state.pageSelDirty) return;   // 用户刚在面板里改过，不要抢
+    const picked = pageCheckedRows();
+    const empty = !picked.all && !picked.rows.length;
+
+    if (empty) {
+      // 只有「上一次是页面同步来的」才跟着清空，否则会误删用户在面板里手选的
+      if (state.selFromPage && state.selected.size) {
+        state.selected = new Set();
+        state.selFromPage = false;
+        setBallBadge(0);
+        if (state.open) render();
+      }
+      return;
+    }
+
+    const hit = new Set();
+    if (picked.all) {
+      state.items.forEach((it) => { if (!it.dir) hit.add(it.fid); });
+    } else {
+      state.items.forEach((it) => {
+        if (it.dir) return;
+        const n = String(it.name || '').replace(/\s+/g, '');
+        if (!n) return;
+        for (const row of picked.rows) {
+          const t = String(row.textContent || '').replace(/\s+/g, '');
+          if (t && t.indexOf(n) >= 0) { hit.add(it.fid); break; }
+        }
+      });
+    }
+    if (!hit.size) return;   // 页面勾的东西不在当前目录里，不动面板
+
+    const same = hit.size === state.selected.size && Array.from(hit).every((f) => state.selected.has(f));
+    state.selFromPage = true;
+    setBallBadge(hit.size);
+    if (same) return;
+    state.selected = hit;
+    if (state.open) render();
+  }
+
+  function bindPageSelectionWatcher() {
+    let timer = null;
+    const kick = () => {
+      if (timer) return;
+      timer = setTimeout(() => {
+        timer = null;
+        try { syncPageSelection(); } catch (e) { /* ignore */ }
+      }, 240);
+    };
+    try {
+      document.addEventListener('click', kick, true);
+      document.addEventListener('change', kick, true);
+    } catch (e) { /* ignore */ }
+    setInterval(kick, 3000);   // 兜底：有些勾选是脚本改状态，不冒泡事件
+  }
+
   function mountUI() {
     if (state.mounted) return;
     state.mounted = true;
@@ -3900,6 +4131,8 @@
       if (!cb) return;
       const fid = cb.dataset.fid;
       if (cb.checked) state.selected.add(fid); else state.selected.delete(fid);
+      state.selFromPage = false;   // 用户在面板里动手了，别再被页面同步覆盖
+      state.pageSelDirty = true;
       const rr = cb.closest('.row');
       if (rr) rr.classList.toggle('sel', cb.checked);
       renderStatus();
@@ -4054,6 +4287,8 @@
     const root = getRoot();
     if (!root) return;
     state.open = true;
+    state.navLock = false;    // 每次打开面板都重新跟一次页面目录
+    state.pageSelDirty = false;
     const badge = root.getElementById('yx-badge');
     if (badge) { badge.textContent = ''; badge.classList.remove('on'); }
     const mask = root.getElementById('yx-mask');
@@ -4065,9 +4300,14 @@
     const plat = detectPlatform(location.href);
     if (plat && !state.ctx) {
       // 移动云盘的分享 ID 在 hash 里（#/w/i/xxx），不能丢掉
-      parseShare(location.href).catch(() => {});
+      parseShare(location.href)
+        .then(() => followPageDir(true))
+        .then(() => syncPageSelection())
+        .catch(() => {});
     } else {
       render();
+      // 页面在子目录 / 已勾选文件时，面板跟上
+      followPageDir(true).then(() => syncPageSelection()).catch(() => {});
     }
 
     // 第一次用给一句人话：下载按钮到底会发生什么
@@ -4150,7 +4390,8 @@
     if (state.ctx) {
       tag.style.display = '';
       const tok = state.platform && state.platform.id === 'baidu' && state.platform.hasToken && state.platform.hasToken();
-      tag.textContent = tok ? '已授权' : (state.ctx.logged ? '已登录' : (state.platform.guestLabel || '游客'));
+      const nick = state.ctx.nick ? String(state.ctx.nick).trim().slice(0, 10) : '';
+      tag.textContent = tok ? '已授权' : (state.ctx.logged ? (nick || '已登录') : (state.platform.guestLabel || '游客'));
       tag.className = 'tag' + (tok || state.ctx.logged ? '' : ' guest');
     } else {
       tag.style.display = 'none';
@@ -4162,7 +4403,10 @@
     else if (state.ctx) {
       const files = state.items.filter((i) => !i.dir).length;
       const dirs = state.items.length - files;
-      sub.textContent = `${state.platform.name} · ${files} 个文件${dirs ? `，${dirs} 个文件夹` : ''}${state.ctx.logged ? '' : ' · ' + (state.platform.guestHint || '游客态有大小限制')}`;
+      const parts = [];
+      if (files) parts.push(`${files} 个文件`);
+      if (dirs) parts.push(`${dirs} 个文件夹`);
+      sub.textContent = `${state.platform.name} · ${parts.join('，') || '空目录'}${state.ctx.logged ? '' : ' · 游客态'}`;
     } else {
       sub.textContent = '粘贴分享链接，一键获取直链';
     }
@@ -4378,10 +4622,12 @@
       return;
     }
     const total = state.items.filter((i) => !i.dir).length;
+    const dirs = state.items.length - total;
     const sel = state.selected.size;
     const tok = state.platform.id === 'baidu' && state.platform.hasToken && state.platform.hasToken();
     const mode = tok ? '令牌已授权' : (state.ctx.logged ? '登录态' : (state.platform.guestLabel || '游客态'));
-    el.textContent = `${state.platform.name} · 共 ${total} 个文件 · 已选 ${sel} · ${mode}`;
+    const count = dirs ? `${total} 文件 / ${dirs} 文件夹` : `${total} 个文件`;
+    el.textContent = `${state.platform.name} · 共 ${count} · 已选 ${sel} · ${mode}`;
     dot.className = 'dot' + (state.ctx.logged || tok ? '' : ' guest');
 
     const allBtn = root.getElementById('yx-select-all');
@@ -4717,6 +4963,7 @@
     mountUI();
     hookPageButtons();
     initAdBlock();
+    bindPageSelectionWatcher();
 
     try {
       if (typeof GM_registerMenuCommand === 'function') {
