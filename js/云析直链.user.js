@@ -66,8 +66,9 @@
 // @connect      *.115cdn.com
 // @connect      *.115rc.com
 // @connect      raw.githubusercontent.com
+// @connect      ghproxy.net
+// @connect      ghfast.top
 // @connect      cdn.jsdelivr.net
-// @connect      fastly.jsdelivr.net
 // @connect      api.github.com
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setClipboard
@@ -4879,27 +4880,22 @@
     'https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%90%E7%9B%B4%E9%93%BE.user.js';
   const REPO_URL = 'https://github.com/zjkl0330/tampermonkey';
 
-  // 检查更新走三个源。raw 优先（raw 不做 CDN 缓存，拿到的版本最准），
-  // 但实测国内直连 raw 经常握手超时，所以再挂两个 jsDelivr 节点兜底：
-  // 它们对分支引用有缓存（最长 12h），版本可能略滞后，聊胜于无。
+  // 检查更新按序试四个源，任一成功即返回（各自超时 6~8 秒，失败就下一个）：
+  //   raw        —— 官方源头，不走 CDN 缓存，版本最准；但国内常握手超时
+  //   ghproxy    —— 公共反代，实测国内 0.6s 通，透传 Range 且带 ACAO: *
+  //   ghfast     —— 同上是另一个反代，用来防单个反代挂掉
+  //   jsDelivr   —— 最后兜底；分支引用最长缓存 12 小时，版本可能滞后
+  // 反代只用来读版本号，安装仍走 @updateURL / @downloadURL 的原始地址。
   const UPDATE_SOURCES = [
-    {
-      name: 'GitHub raw',
-      url: RAW_URL,
-      bust: true,
-      timeout: 8000
-    },
+    { name: 'GitHub raw', url: RAW_URL, bust: true, timeout: 6000 },
+    { name: 'ghproxy.net', url: 'https://ghproxy.net/' + RAW_URL, bust: false, timeout: 8000 },
+    { name: 'ghfast.top', url: 'https://ghfast.top/' + RAW_URL, bust: false, timeout: 8000 },
     {
       name: 'jsDelivr',
       url: 'https://cdn.jsdelivr.net/gh/zjkl0330/tampermonkey@main/js/%E4%BA%91%E6%9E%90%E7%9B%B4%E9%93%BE.user.js',
       bust: false,
-      timeout: 10000
-    },
-    {
-      name: 'jsDelivr(Fastly)',
-      url: 'https://fastly.jsdelivr.net/gh/zjkl0330/tampermonkey@main/js/%E4%BA%91%E6%9E%90%E7%9B%B4%E9%93%BE.user.js',
-      bust: false,
-      timeout: 10000
+      timeout: 8000,
+      lag: true
     }
   ];
 
@@ -4918,12 +4914,13 @@
     return 0;
   }
 
-  async function fetchRemoteVersion() {
+  async function fetchRemoteVersion(onTry) {
     // 只要脚本头 2KB：Range 是 CORS 安全请求头，不用预检；
-    // 整包 16 万字节在部分手机浏览器里读 body 会卡住，取头又准又快
+    // 整包 20 万字节在部分手机浏览器里读 body 会卡住，取头又准又快
     const errs = [];
     for (const src of UPDATE_SOURCES) {
       try {
+        if (typeof onTry === 'function') onTry(src);
         const res = await gmRequest({
           method: 'GET',
           url: src.bust ? `${src.url}?t=${Date.now()}` : src.url,
@@ -4937,7 +4934,7 @@
         const text = String((res && res.responseText) || '').slice(0, 4096);
         const m = text.match(/@version\s+([0-9][0-9.]*)/);
         if (!m) throw new Error('脚本头里没有 @version');
-        return { version: m[1], source: src.name };
+        return { version: m[1], source: src.name, lag: !!src.lag };
       } catch (e) {
         errs.push(`${src.name}: ${e.message || e}`);
       }
@@ -4960,21 +4957,32 @@
     const el = root && root.getElementById('yx-update-line');
     if (!el) return;
     const info = state.updateInfo;
-    if (info && info.has) {
+    if (info && info.checking) {
+      el.textContent = `正在检查更新…（${info.src || '连接中'}）`;
+    } else if (info && info.has) {
       el.innerHTML = `版本 v${APP.version} → <b style="color:#fbbf24">v${esc(info.latest)}</b> 可更新`;
     } else if (info && info.has === false) {
-      el.textContent = `版本 v${APP.version} · 已是最新`;
+      el.textContent = info.lag
+        ? `版本 v${APP.version} · 已是最新（CDN 缓存，最多滞后 12 小时）`
+        : `版本 v${APP.version} · 已是最新`;
     } else {
       el.textContent = `版本 v${APP.version} · 无口令 / 无授权码`;
     }
   }
 
   async function checkUpdate(manual) {
-    if (manual) toastRootPush('正在检查更新…', 'info', 1200);
+    if (manual) {
+      state.updateInfo = { checking: true, src: UPDATE_SOURCES[0].name };
+      renderUpdateLine();
+    }
     try {
-      const { version: latest, source } = await fetchRemoteVersion();
+      const { version: latest, source, lag } = await fetchRemoteVersion((src) => {
+        if (!manual) return;
+        state.updateInfo = { checking: true, src: src.name };
+        renderUpdateLine();
+      });
       const has = cmpVersion(latest, APP.version) > 0;
-      state.updateInfo = { latest, has };
+      state.updateInfo = { latest, has, lag };
       GMStore.set('yx_update', { t: Date.now(), latest, has });
       renderUpdateLine();
       if (has) {
@@ -4983,12 +4991,18 @@
           openInstallPage();
         }
       } else if (manual) {
-        toastRootPush(`已是最新版本 v${APP.version}（源：${source}）`);
+        toastRootPush(
+          lag
+            ? `已是最新 v${APP.version}（经 ${source} 读取，CDN 缓存可能滞后）`
+            : `已是最新版本 v${APP.version}（源：${source}）`
+        );
       }
       return { latest, has };
     } catch (e) {
+      state.updateInfo = null;
+      renderUpdateLine();
       if (manual) {
-        toastRootPush(`检查更新失败：${e.message || e}｜三个源都不通时可到项目主页手动下载`, 'err', 5200);
+        toastRootPush(`检查更新失败：${e.message || e}｜四个源都不通时可到项目主页手动下载`, 'err', 5200);
       }
       return null;
     }
