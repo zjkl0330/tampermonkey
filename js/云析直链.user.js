@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         云析直链 · 网盘直链下载助手
 // @namespace    https://github.com/CYQawa/YunX
-// @version      1.9.3
+// @version      1.10.0
 // @author       云析直链（YunX 移植）
 // @description  夸克 / UC / 123 / 115 / 天翼 / 移动 / 百度 / 迅雷 / 阿里 / 城通 网盘分享直链解析，附分享页去广告：自动列目录、8 线程分片下载、暂停续传，可导出 IDM / Aria2 / cURL 命令。无口令、无授权码，装上即用。
 // @license      AGPL-3.0-or-later
@@ -16,6 +16,8 @@
 // @match        https://www.123pan.com/s/*
 // @match        https://www.123pan.cn/s/*
 // @match        https://yun.123pan.cn/*
+// @match        https://yun.123pan.com/*
+// @match        https://www.123865.com/*
 // @match        https://share.123pan.cn/123pan/*
 // @match        https://115.com/s/*
 // @match        https://115cdn.com/s/*
@@ -89,7 +91,7 @@
    * 0. 常量
    * ===================================================================== */
 
-  const APP = { name: '云析直链', version: '1.9.3' };
+  const APP = { name: '云析直链', version: '1.10.0' };
 
   // 夸克 PC 客户端 UA：列表 / 取链接口都校验它
   const UA_QUARK =
@@ -837,6 +839,190 @@
       ctx.title = (json.data && json.data.ShareName) || '';
     },
 
+    /* ---------------- 个人网盘（登录后的 yun.123pan.cn） ----------------
+     * 分享页走 /b/api/share/*，个人盘走 yun.123pan.cn/api/file/*，两套完全不同的口子。
+     * 个人盘的凭据是登录后落在 localStorage 里的 accessToken，页面自己也是这么取的。
+     * 目录/下载参数对齐 OpenList 的 123 驱动（drivers/123/util.go），字段名不能改。
+     */
+    MINE_HOSTS: ['yun.123pan.cn', 'yun.123pan.com', 'www.123865.com', 'www.123pan.cn', 'www.123pan.com'],
+
+    pickMine(url) {
+      let u;
+      try { u = new URL(url); } catch (e) { return null; }
+      if (this.MINE_HOSTS.indexOf(u.hostname) < 0) return null;
+      if (this.pick(url)) return null;   // 分享页有 shareKey，走分享链路
+      if (/\/s\//.test(u.pathname)) return null;
+      return { mine: true };
+    },
+
+    mineToken() {
+      const pick = (v) => {
+        let s = String(v || '').trim();
+        if (!s) return '';
+        if (s.charAt(0) === '{') {
+          try {
+            const o = JSON.parse(s);
+            s = o.token || o.accessToken || o.access_token || '';
+          } catch (e) { return ''; }
+        }
+        return String(s || '').replace(/^"|"$/g, '');
+      };
+      for (const k of ['accessToken', 'authorToken', 'token', 'access_token']) {
+        try {
+          const t = pick(localStorage.getItem(k));
+          if (t && t.length > 12) return t;
+        } catch (e) { /* ignore */ }
+      }
+      try {
+        const o = JSON.parse(localStorage.getItem('userin') || 'null');
+        const t = o && (o.token || o.accessToken || (o.data && o.data.token));
+        if (t) return String(t);
+      } catch (e) { /* ignore */ }
+      return '';
+    },
+
+    mineHeaders(ctx) {
+      return {
+        'authorization': `Bearer ${ctx.token}`,
+        'platform': 'web',
+        'app-version': '3',
+        'origin': ctx.base,
+        'referer': ctx.base + '/',
+        'content-type': 'application/json;charset=UTF-8'
+      };
+    },
+
+    mineError(json) {
+      const code = Number(json && json.code);
+      if (code === 20101 || code === 401 || code === 403) {
+        return '123 云盘登录态无效或已过期：请在 yun.123pan.cn 重新登录，然后刷新页面';
+      }
+      if (code === 5113) return '这个目录需要会员权限，或文件已被删除';
+      return apiMessage(json, '123 云盘接口返回异常');
+    },
+
+    async mineInit(ctx) {
+      ctx.mine = true;
+      ctx.base = 'https://yun.123pan.cn';
+      ctx.token = this.mineToken();
+      if (!ctx.token) {
+        throw new Error('读不到登录令牌：请先在这个浏览器里登录 yun.123pan.cn，再刷新页面（令牌存在 localStorage，换浏览器/无痕模式都要重登）');
+      }
+      // 用 user/info 验一次，顺带拿昵称当标题
+      try {
+        const res = await gmRequest({ url: `${ctx.base}/api/user/info`, headers: this.mineHeaders(ctx) });
+        const json = parseJSON(res, '校验登录态失败');
+        if (Number(json.code) !== 0) throw new Error(this.mineError(json));
+        const d = json.data || {};
+        ctx.title = d.Nickname || d.nickname || '我的云盘';
+        ctx.nick = ctx.title;
+        ctx.logged = true;
+      } catch (e) {
+        if (/登录/.test(e.message || '')) throw e;
+        ctx.title = '我的云盘';
+        ctx.logged = true;
+      }
+    },
+
+    async mineList(ctx, dirId) {
+      const out = [];
+      const seen = new Set();
+      const parent = String(dirId || '0');
+      for (let page = 1; page <= 50; page++) {
+        const qs = new URLSearchParams({
+          driveId: '0',
+          limit: '100',
+          next: '0',
+          orderBy: 'file_id',
+          orderDirection: 'desc',
+          parentFileId: parent,
+          trashed: 'false',
+          SearchData: '',
+          Page: String(page),
+          OnlyLookAbnormalFile: '0',
+          event: 'homeListFile',
+          operateType: '4',
+          inDirectSpace: 'false'
+        });
+        const res = await gmRequest({ url: `${ctx.base}/api/file/list/new?${qs.toString()}`, headers: this.mineHeaders(ctx) });
+        const json = parseJSON(res, '读取云盘目录失败');
+        if (Number(json.code) !== 0) throw new Error(this.mineError(json));
+        const data = json.data || {};
+        const arr = data.InfoList || [];
+        for (const it of arr) {
+          const fid = String(it.FileId);
+          if (seen.has(fid)) continue;
+          seen.add(fid);
+          out.push({
+            fid,
+            name: it.FileName || '未命名',
+            size: Number(it.Size || 0),
+            dir: Number(it.Type) === 1,
+            token: `${it.S3KeyFlag || ''}|${it.Etag || ''}|0`
+          });
+        }
+        if (String(data.Next) === '-1' || !arr.length) break;
+        await sleep(80);
+      }
+      return out;
+    },
+
+    async mineLink(ctx, file) {
+      const parts = String(file.token || '').split('|');
+      const s3keyFlag = parts[0] || '';
+      const etag = parts[1] || '';
+      const res = await gmRequest({
+        method: 'POST',
+        url: `${ctx.base}/api/file/download_info`,
+        headers: this.mineHeaders(ctx),
+        data: JSON.stringify({
+          driveId: 0,
+          etag,
+          fileId: Number(file.fid),
+          fileName: file.name,
+          s3keyFlag,
+          size: Number(file.size || 0),
+          type: 0
+        })
+      });
+      const json = parseJSON(res, '获取直链失败');
+      if (Number(json.code) !== 0) throw new Error(this.mineError(json));
+      const d = json.data || {};
+      let url = decode123Url(d.DownloadUrl || d.DownloadURL || '');
+      if (!url) throw new Error('没拿到直链，可能是当日流量用完或触发了风控');
+      // DownloadUrl 指向一个会 302 到 CDN 的中转，解出最终地址方便丢给 IDM / aria2
+      const final = await this.resolveMineUrl(url);
+      return {
+        url: final || url,
+        headers: { Referer: 'https://yun.123pan.cn/', 'User-Agent': UA_123_WEB },
+        guest: false,
+        filename: d.FileName || file.name,
+        size: Number(d.Size || file.size || 0)
+      };
+    },
+
+    // 跟一次中转：优先读 finalUrl，其次读返回体里的 redirect_url，都不行就原样返回
+    async resolveMineUrl(url) {
+      try {
+        const res = await gmRequest({
+          url,
+          headers: { Referer: 'https://yun.123pan.cn/', 'User-Agent': UA_123_WEB },
+          timeout: 12000
+        });
+        const fin = (res && (res.finalUrl || res.responseURL)) || '';
+        if (fin && fin !== url && /^https?:/i.test(fin)) return fin;
+        const text = String((res && res.responseText) || '');
+        if (text.charAt(0) === '{') {
+          try {
+            const o = JSON.parse(text);
+            const r = o && o.data && (o.data.redirect_url || o.data.RedirectUrl);
+            if (r) return r;
+          } catch (e) { /* ignore */ }
+        }
+      } catch (e) { /* 中转失败不影响把原链接交给下载器 */ }
+      return '';
+    },
+
     async _list(ctx, dirId, next, page) {
       const qs = new URLSearchParams({
         limit: '100',
@@ -863,6 +1049,11 @@
     },
 
     async list(ctx, dirId) {
+      if (ctx && ctx.mine) return this.mineList(ctx, dirId);
+      return this.listShare(ctx, dirId);
+    },
+
+    async listShare(ctx, dirId) {
       const out = [];
       const seen = new Set();
       let next = '0';
@@ -896,6 +1087,7 @@
     },
 
     async link(ctx, file) {
+      if (ctx && ctx.mine) return this.mineLink(ctx, file);
       const token = read123Token();
       if (!token) {
         throw new Error('123 云盘取直链需登录：请在本站登录 123 账号后刷新页面');
@@ -2465,6 +2657,10 @@
     for (const p of PLATFORMS) {
       if (p.pick(url)) return p;
     }
+    // 个人网盘：没有分享 key，但域名是「登录后的盘」
+    for (const p of PLATFORMS) {
+      if (p.pickMine && p.pickMine(url)) return p;
+    }
     return null;
   }
 
@@ -2487,6 +2683,7 @@
     error: '',
     filter: '',
     shareUrl: '',
+    mine: false,       // 当前是「个人网盘」模式而不是分享页
     navLock: false,     // 用户在面板里手动进过目录后，不再跟随页面的目录变化
     selFromPage: false, // 当前选中是否来自页面勾选同步
     pageSelDirty: false, // 用户在面板里手动改过选择，别再被页面同步覆盖
@@ -2505,6 +2702,7 @@
     state.error = '';
     state.filter = '';
     state.shareUrl = '';
+    state.mine = false;
   }
 
   async function parseShare(rawUrl, pwdOverride) {
@@ -2524,6 +2722,9 @@
     }
     const picked = platform.pick(url);
     if (!picked) {
+      if (platform.pickMine && platform.pickMine(url)) {
+        return parseMine(platform, url);
+      }
       state.error = '这个页面不是分享页，请打开具体的分享链接';
       state.loading = false;
       render();
@@ -2560,6 +2761,88 @@
       state.loading = false;
       render();
     }
+  }
+
+  // 个人网盘：不走分享链路，直接读当前登录态下的目录
+  async function parseMine(platform, url) {
+    resetShare();
+    state.platform = platform;
+    state.shareUrl = '';
+    state.mine = true;
+    state.ctx = { mine: true, id: '', pwd: '', title: '', logged: false };
+    state.loading = true;
+    state.error = '';
+    render();
+    try {
+      await platform.mineInit(state.ctx);
+      state.items = await platform.mineList(state.ctx, '0');
+      state.stack = [{ id: '0', name: '我的云盘' }];
+      state.selected.clear();
+      state.links.clear();
+    } catch (e) {
+      state.error = e && e.message ? e.message : '读取云盘目录失败';
+      state.items = [];
+      state.stack = [{ id: '0', name: '我的云盘' }];
+    } finally {
+      state.loading = false;
+      render();
+    }
+  }
+
+  // 个人盘刷新：只重读当前所在目录，不动面包屑
+  async function reloadMine() {
+    if (!state.platform || !state.ctx || !state.ctx.mine) return;
+    const top = state.stack[state.stack.length - 1] || { id: '0' };
+    state.loading = true;
+    state.error = '';
+    render();
+    try {
+      state.items = await state.platform.mineList(state.ctx, top.id);
+      state.selected.clear();
+      state.links.clear();
+      toastRootPush(`已刷新：${state.items.length} 项`);
+    } catch (e) {
+      state.error = e && e.message ? e.message : '刷新失败';
+    } finally {
+      state.loading = false;
+      render();
+    }
+  }
+
+  // 123 个人盘诊断：登录态 / 根目录 / 首个文件取链，一步步打印，出了问题直接把输出发我
+  async function diagnose123() {
+    const p = PLATFORMS.find((x) => x && x.id === 'pan123');
+    if (!p) return;
+    const ctx = { mine: true, base: 'https://yun.123pan.cn', token: p.mineToken() };
+    const lines = [
+      `页面：${location.hostname}${location.pathname}`,
+      `令牌：${ctx.token ? ctx.token.slice(0, 14) + '…（共 ' + ctx.token.length + ' 字符）' : 'localStorage 里没读到'}`
+    ];
+    try {
+      if (!ctx.token) throw new Error('没有令牌，先登录 yun.123pan.cn');
+      const info = await gmRequest({ url: ctx.base + '/api/user/info', headers: p.mineHeaders(ctx) });
+      const j = parseJSON(info, 'user/info');
+      lines.push(`user/info：code=${j.code}，昵称=${(j.data && (j.data.Nickname || j.data.nickname)) || '-'}`);
+      if (Number(j.code) !== 0) throw new Error(`登录态被拒：${p.mineError(j)}`);
+      const list = await p.mineList(ctx, '0');
+      lines.push(`根目录：${list.length} 项 → ${list.slice(0, 5).map((i) => i.name).join(' / ') || '空'}`);
+      const f = list.find((i) => !i.dir);
+      if (!f) lines.push('取链：根目录没有文件，跳过');
+      else {
+        try {
+          const r = await p.mineLink(ctx, f);
+          lines.push(`取链：成功「${f.name}」→ ${String(r.url).slice(0, 70)}…`);
+        } catch (e) {
+          lines.push(`取链失败：${e.message}`);
+        }
+      }
+    } catch (e) {
+      lines.push(`失败：${e.message}`);
+    }
+    const text = lines.join('\n');
+    console.log('[云析直链] 123 个人盘诊断\n' + text);
+    try { copyText(text); } catch (e) { /* ignore */ }
+    toastRootPush('诊断结果已复制，并打印在控制台（F12 → Console）', 'info', 5000);
   }
 
   // 一键授权百度：打开授权页（脚本自动点允许）→ 回写 token → 重解析
@@ -3735,19 +4018,31 @@
   }
 
   // 页面上当前勾选了哪些行（手机是 .file-item，桌面是 antd 表格行）
+  // 123 这类自绘表格既没有 tr 也没有 .file-item，只能从勾选框往上找带文件名单元格的祖先
+  function rowFromCheckbox(cb) {
+    let el = cb && cb.parentElement;
+    for (let i = 0; el && i < 8; i++, el = el.parentElement) {
+      try {
+        if (el.querySelector && el.querySelector('[class*="file-name"], [class*="fileName"], [class*="table-file"], [class*="file_name"]')) return el;
+      } catch (e) { /* ignore */ }
+    }
+    return null;
+  }
+
   function pageCheckedRows() {
     const rows = [];
     let all = false;
     try {
       Array.from(document.querySelectorAll('input[type=checkbox]:checked')).forEach((cb) => {
         if (inOurUI(cb)) return;
-        const row = cb.closest('.file-item, tr.ant-table-row, .ant-table-row, [class*="file-row"], [class*="fileRow"]');
+        const row = cb.closest('.file-item, tr.ant-table-row, .ant-table-row, [class*="file-row"], [class*="fileRow"], [class*="rowSelected"], [class*="table-row"], [class*="tableRow"]') ||
+          rowFromCheckbox(cb);
         if (row && !inOurUI(row)) { rows.push(row); return; }
         // 落在表头 / 全选位置的勾选框 → 视为全选
         const head = cb.closest('thead, [class*="header"], [class*="Header"]');
         if (head) all = true;
       });
-      Array.from(document.querySelectorAll('.ant-table-row-selected, .file-item.selected, .file-item.checked')).forEach((r) => {
+      Array.from(document.querySelectorAll('.ant-table-row-selected, .file-item.selected, .file-item.checked, [class*="rowSelected"]')).forEach((r) => {
         if (!inOurUI(r) && rows.indexOf(r) < 0) rows.push(r);
       });
     } catch (e) { /* ignore */ }
@@ -3805,12 +4100,70 @@
     if (state.open) render();
   }
 
+  /* ---- 123 个人盘：跟着页面所在目录走 ------------------------------------
+   * 123 的盘内切目录不换 URL，面板没法从地址栏看出用户在哪个目录。
+   * 但它自己每次列表都会带 parentFileId，把这个参数记下来就够了——
+   * 比「靠页面文件名逐层反推」可靠得多（那套只对夸克/UC 有效）。
+   */
+  let pageMineDir = '';        // 页面最近一次列目录用的 parentFileId
+
+  function hookMineDir() {
+    try {
+      if (!/123pan\.(cn|com)$/.test(location.hostname)) return;
+      const w = (typeof unsafeWindow !== 'undefined' && unsafeWindow) || window;
+      if (!w || w.__yxMineHooked) return;
+      w.__yxMineHooked = 1;
+      const grab = (u) => {
+        const m = String(u || '').match(/[?&]parentFileId=(\d+)/);
+        if (m && m[1]) pageMineDir = m[1];
+      };
+      if (typeof w.fetch === 'function') {
+        const of = w.fetch;
+        w.fetch = function (input, init) {
+          try { grab(typeof input === 'string' ? input : (input && input.url)); } catch (e) { /* ignore */ }
+          return of.apply(this, arguments);
+        };
+      }
+      if (w.XMLHttpRequest && w.XMLHttpRequest.prototype) {
+        const op = w.XMLHttpRequest.prototype.open;
+        w.XMLHttpRequest.prototype.open = function (m, u) {
+          try { grab(u); } catch (e) { /* ignore */ }
+          return op.apply(this, arguments);
+        };
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  async function followMineDir(force) {
+    if (!state.ctx || !state.ctx.mine || !state.platform) return false;
+    if (state.navLock && !force) return false;
+    if (!pageMineDir || pageMineDir === '0') return false;
+    const top = state.stack[state.stack.length - 1];
+    if (top && top.id === pageMineDir) return false;
+    if (Date.now() - lastFollowAt < 1500) return false;
+    lastFollowAt = Date.now();
+    try {
+      const list = await state.platform.mineList(state.ctx, pageMineDir);
+      state.items = list;
+      state.stack = [{ id: '0', name: '我的云盘' }, { id: pageMineDir, name: '页面所在目录' }];
+      state.selected.clear();
+      state.selFromPage = false;
+      if (state.open) render();
+      return true;
+    } catch (e) {
+      // 这个目录读不了（权限/风控），先把标记清掉，别每 3 秒重试一次
+      pageMineDir = '';
+      return false;
+    }
+  }
+
   function bindPageSelectionWatcher() {
     let timer = null;
     const kick = () => {
       if (timer) return;
-      timer = setTimeout(() => {
+      timer = setTimeout(async () => {
         timer = null;
+        try { if (state.mine) await followMineDir(); } catch (e) { /* ignore */ }
         try { syncPageSelection(); } catch (e) { /* ignore */ }
       }, 240);
     };
@@ -4119,7 +4472,11 @@
       } catch (e) { /* ignore */ }
       window.open(REPO_URL, '_blank', 'noopener');
     });
-    on('yx-refresh', 'click', () => { if (state.shareUrl) parseShare(state.shareUrl); else openPanel(); });
+    on('yx-refresh', 'click', () => {
+      if (state.mine) { reloadMine(); return; }
+      if (state.shareUrl) parseShare(state.shareUrl);
+      else openPanel();
+    });
     on('yx-copy-sel', 'click', copySelected);
     on('yx-select-all', 'click', selectAll);
     on('yx-export', 'click', exportAria2);
@@ -4404,7 +4761,7 @@
 
     const sub = root.getElementById('yx-sub');
     if (state.error) sub.textContent = state.error;
-    else if (state.loading) sub.textContent = '正在解析…';
+    else if (state.loading) sub.textContent = state.mine ? '正在读取云盘目录…' : '正在解析…';
     else if (state.ctx) {
       const files = state.items.filter((i) => !i.dir).length;
       const dirs = state.items.length - files;
@@ -4649,10 +5006,16 @@
 
   function preloadFor(url) {
     const plat = detectPlatform(url);
-    if (!plat || !plat.pick(url)) return;
+    if (!plat) return;
+    const isShare = !!plat.pick(url);
+    const isMine = !isShare && !!(plat.pickMine && plat.pickMine(url));
+    if (!isShare && !isMine) return;
     if (!settings.autoParse) return;
-    if (state.ctx && state.shareUrl === url) return;
-    parseShare(url).then(() => {
+    if (isShare && state.ctx && state.shareUrl === url) return;
+    // 已经在个人盘会话里就别重拉：盘内切目录不换 URL，重拉会把当前目录顶回根
+    if (isMine && state.ctx && state.ctx.mine) return;
+    const job = isMine ? parseMine(plat, url) : parseShare(url);
+    job.then(() => {
       const root = getRoot();
       if (!root) return;
       const badge = root.getElementById('yx-badge');
@@ -4745,6 +5108,11 @@
 
   function initAdBlock() {
     const ID = 'yx-adblock';
+    // 个人网盘是自己的文件列表，去广告规则（[class^="ad-"] 那类）有误伤风险，干脆不注入
+    try {
+      const p0 = detectPlatform(location.href);
+      if (p0 && p0.pickMine && p0.pickMine(location.href) && !p0.pick(location.href)) return;
+    } catch (e) { /* ignore */ }
     const old = document.getElementById(ID);
     if (!settings.adBlock) { if (old) old.remove(); return; }
     if (old) return;
@@ -5013,12 +5381,14 @@
     mountUI();
     hookPageButtons();
     initAdBlock();
+    hookMineDir();
     bindPageSelectionWatcher();
 
     try {
       if (typeof GM_registerMenuCommand === 'function') {
         GM_registerMenuCommand('⚡ 打开直链面板', () => openPanel());
         GM_registerMenuCommand('⚙ 云析直链设置', () => { state.settingsOpen = true; openPanel(); render(); });
+        GM_registerMenuCommand('🔍 诊断 123 个人盘', () => { diagnose123(); });
       }
     } catch (e) { /* ignore */ }
 
