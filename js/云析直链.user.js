@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         云析直链 · 网盘直链下载助手
 // @namespace    https://github.com/CYQawa/YunX
-// @version      1.9.2
+// @version      1.9.3
 // @author       云析直链（YunX 移植）
 // @description  夸克 / UC / 123 / 115 / 天翼 / 移动 / 百度 / 迅雷 / 阿里 / 城通 网盘分享直链解析，附分享页去广告：自动列目录、8 线程分片下载、暂停续传，可导出 IDM / Aria2 / cURL 命令。无口令、无授权码，装上即用。
 // @license      AGPL-3.0-or-later
@@ -66,6 +66,8 @@
 // @connect      *.115cdn.com
 // @connect      *.115rc.com
 // @connect      raw.githubusercontent.com
+// @connect      cdn.jsdelivr.net
+// @connect      fastly.jsdelivr.net
 // @connect      api.github.com
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setClipboard
@@ -86,7 +88,7 @@
    * 0. 常量
    * ===================================================================== */
 
-  const APP = { name: '云析直链', version: '1.9.2' };
+  const APP = { name: '云析直链', version: '1.9.3' };
 
   // 夸克 PC 客户端 UA：列表 / 取链接口都校验它
   const UA_QUARK =
@@ -4867,7 +4869,7 @@
   }
 
   /* =======================================================================
-   * 7. 自动更新（分发源：GitHub raw）
+   * 7. 自动更新（分发源：GitHub raw + jsDelivr 兜底）
    * -----------------------------------------------------------------------
    * @updateURL / @downloadURL 已指向仓库，脚本管理器会自己按周期拉新版；
    * 这里再补一层：面板内手动检查 + 每 24 小时静默检查，方便看版本差异。
@@ -4876,6 +4878,30 @@
   const RAW_URL =
     'https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%90%E7%9B%B4%E9%93%BE.user.js';
   const REPO_URL = 'https://github.com/zjkl0330/tampermonkey';
+
+  // 检查更新走三个源。raw 优先（raw 不做 CDN 缓存，拿到的版本最准），
+  // 但实测国内直连 raw 经常握手超时，所以再挂两个 jsDelivr 节点兜底：
+  // 它们对分支引用有缓存（最长 12h），版本可能略滞后，聊胜于无。
+  const UPDATE_SOURCES = [
+    {
+      name: 'GitHub raw',
+      url: RAW_URL,
+      bust: true,
+      timeout: 8000
+    },
+    {
+      name: 'jsDelivr',
+      url: 'https://cdn.jsdelivr.net/gh/zjkl0330/tampermonkey@main/js/%E4%BA%91%E6%9E%90%E7%9B%B4%E9%93%BE.user.js',
+      bust: false,
+      timeout: 10000
+    },
+    {
+      name: 'jsDelivr(Fastly)',
+      url: 'https://fastly.jsdelivr.net/gh/zjkl0330/tampermonkey@main/js/%E4%BA%91%E6%9E%90%E7%9B%B4%E9%93%BE.user.js',
+      bust: false,
+      timeout: 10000
+    }
+  ];
 
   function vnum(v) {
     return String(v || '0').split('.').map((x) => parseInt(x, 10) || 0);
@@ -4895,20 +4921,28 @@
   async function fetchRemoteVersion() {
     // 只要脚本头 2KB：Range 是 CORS 安全请求头，不用预检；
     // 整包 16 万字节在部分手机浏览器里读 body 会卡住，取头又准又快
-    const res = await gmRequest({
-      method: 'GET',
-      url: `${RAW_URL}?t=${Date.now()}`,
-      headers: { 'Range': 'bytes=0-2047' },
-      // 跨域拉 raw 不能带 Cookie：对方允许源是 *，带凭据会被浏览器直接判 CORS 失败
-      credentials: 'omit',
-      timeout: 15000
-    });
-    const code = res && res.status;
-    if (!(code >= 200 && code < 300)) throw new Error(`拉取失败（HTTP ${code || 0}）`);
-    const text = String((res && res.responseText) || '').slice(0, 4096);
-    const m = text.match(/@version\s+([0-9][0-9.]*)/);
-    if (!m) throw new Error('远端脚本头里没有 @version');
-    return m[1];
+    const errs = [];
+    for (const src of UPDATE_SOURCES) {
+      try {
+        const res = await gmRequest({
+          method: 'GET',
+          url: src.bust ? `${src.url}?t=${Date.now()}` : src.url,
+          headers: { 'Range': 'bytes=0-2047' },
+          // 跨域拉 raw 不能带 Cookie：对方允许源是 *，带凭据会被浏览器直接判 CORS 失败
+          credentials: 'omit',
+          timeout: src.timeout
+        });
+        const code = res && res.status;
+        if (!(code >= 200 && code < 300)) throw new Error(`HTTP ${code || 0}`);
+        const text = String((res && res.responseText) || '').slice(0, 4096);
+        const m = text.match(/@version\s+([0-9][0-9.]*)/);
+        if (!m) throw new Error('脚本头里没有 @version');
+        return { version: m[1], source: src.name };
+      } catch (e) {
+        errs.push(`${src.name}: ${e.message || e}`);
+      }
+    }
+    throw new Error(errs.join(' / '));
   }
 
   function openInstallPage() {
@@ -4938,7 +4972,7 @@
   async function checkUpdate(manual) {
     if (manual) toastRootPush('正在检查更新…', 'info', 1200);
     try {
-      const latest = await fetchRemoteVersion();
+      const { version: latest, source } = await fetchRemoteVersion();
       const has = cmpVersion(latest, APP.version) > 0;
       state.updateInfo = { latest, has };
       GMStore.set('yx_update', { t: Date.now(), latest, has });
@@ -4949,12 +4983,12 @@
           openInstallPage();
         }
       } else if (manual) {
-        toastRootPush(`已是最新版本 v${APP.version}`);
+        toastRootPush(`已是最新版本 v${APP.version}（源：${source}）`);
       }
       return { latest, has };
     } catch (e) {
       if (manual) {
-        toastRootPush(`检查更新失败：${e.message || e}｜raw 域名国内可能不通，可到项目主页手动下载`, 'err', 5200);
+        toastRootPush(`检查更新失败：${e.message || e}｜三个源都不通时可到项目主页手动下载`, 'err', 5200);
       }
       return null;
     }

@@ -33,15 +33,18 @@ https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%
 | 面板「设置 → 检查更新」 | 手动查：显示 `版本 v1.9.0 → v2.0.0 可更新`，确认后直接跳安装页 |
 | 静默日检 | 每次打开页面时，距上次检查超过 24 小时才查一次；没新版不弹任何东西 |
 | 版本对照 | 设置面板底部显示当前版本，仓库 `js/云析直链.user.js` 头部是同一份 `@version` |
+| 三源回退（v1.9.3） | raw 超时 8s 后自动换 `cdn.jsdelivr.net`，再换 `fastly.jsdelivr.net`，只有一个源通就够；成功时会提示用的是哪个源 |
 
-更新失败时脚本会**说出原因**（HTTP 码 / 网络不通 / 域名没授权），不会只丢一句「网络错误」。
+更新失败时脚本会**说出原因**（每个源各自的 HTTP 码 / 超时 / 域名没授权），不会只丢一句「网络错误」。
 
-> `raw.githubusercontent.com` 在国内偶尔连不上。连不上就把 `@updateURL` / `@downloadURL` 换成镜像：
+> `raw.githubusercontent.com` 在国内经常连不上（实测同一网络下时不时直接握手超时 30s）。v1.9.3 起检查更新自带 jsDelivr 两个节点兜底，不用再手动改 `@updateURL`。
+> 如果三个源全不通，就直接重新下载覆盖安装——设置（含百度令牌）存在扩展里，不会丢。
+
+> 全都不通时，还可以走镜像下载安装（只能手动装，不能当检查更新的数据源）：
 > `https://gh.zjkl0330.dpdns.org/zjkl0330/tampermonkey/raw/main/js/%E4%BA%91%E6%9E%90%E7%9B%B4%E9%93%BE.user.js`
-> 或者直接重新下载覆盖安装，设置（含百度令牌）存在扩展里，不会丢。
 >
 > 注意：镜像会把文件里的 `github.com` 改写成自己的域，`@namespace` 跟着变，篡改猴可能提示「脚本已存在，是否覆盖」——点覆盖即可，仍然是一个脚本。
-> 镜像响应不带 `Access-Control-Allow-Origin`，所以**不能**当自动检查更新的数据源（浏览器会 CORS 拦掉），只能用来下载安装。
+> 镜像响应不带 `Access-Control-Allow-Origin`，浏览器跨域读不了，所以**不能**当自动检查更新的数据源。
 
 ### 运行范围（v1.9.0 起收窄）
 
