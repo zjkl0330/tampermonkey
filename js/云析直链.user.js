@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         云析直链 · 网盘直链下载助手
 // @namespace    https://github.com/CYQawa/YunX
-// @version      1.13.0
+// @version      1.13.1
 // @author       云析直链（YunX 移植）
 // @description  夸克 / UC / 123 / 115 / 天翼 / 移动 / 百度 / 迅雷 / 阿里 / 城通 网盘分享直链解析，附分享页去广告：自动列目录、8 线程分片下载、暂停续传，可导出 IDM / Aria2 / cURL 命令。无口令、无授权码，装上即用。
 // @license      AGPL-3.0-or-later
@@ -94,7 +94,7 @@
    * 0. 常量
    * ===================================================================== */
 
-  const APP = { name: '云析直链', version: '1.12.0' };
+  const APP = { name: '云析直链', version: '1.13.1' };
 
   // 夸克 PC 客户端 UA：列表 / 取链接口都校验它
   const UA_QUARK =
@@ -4401,10 +4401,17 @@
       letter-spacing: .2px;
     }
     .ext.folder { background: #fbbf24; }
-    .nm .txt { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+    .nm .txt { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
     .folder .txt { cursor: pointer; }
     .folder .txt:hover { color: var(--acc, #1e6fff); }
     .sz { flex: 0 0 116px; text-align: right; color: #94a3b8; font-size: 12px; font-variant-numeric: tabular-nums; }
+    /* 手机窄屏：大小列和按钮列让一点位置给文件名，否则文件名会被挤成只剩图标 */
+    @media (max-width: 470px) {
+      .row { gap: 8px; padding: 9px 12px; }
+      .sz { flex: 0 0 72px; }
+      .ops { min-width: 112px; gap: 4px; }
+      .mini { padding: 0 7px; }
+    }
     .ops { flex: 0 0 auto; display: flex; gap: 6px; align-items: center; min-width: 132px; justify-content: flex-end; }
     .row .state { font-size: 11px; color: #94a3b8; margin-right: 4px; white-space: nowrap; }
     .mini {
