@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         云析直链 · 网盘直链下载助手
 // @namespace    https://github.com/CYQawa/YunX
-// @version      1.9.0
+// @version      1.9.1
 // @author       云析直链（YunX 移植）
 // @description  夸克 / UC / 123 / 115 / 天翼 / 移动 / 百度 / 迅雷 / 阿里 / 城通 网盘分享直链解析，附分享页去广告：自动列目录、8 线程分片下载、暂停续传，可导出 IDM / Aria2 / cURL 命令。无口令、无授权码，装上即用。
 // @license      AGPL-3.0-or-later
@@ -86,7 +86,7 @@
    * 0. 常量
    * ===================================================================== */
 
-  const APP = { name: '云析直链', version: '1.9.0' };
+  const APP = { name: '云析直链', version: '1.9.1' };
 
   // 夸克 PC 客户端 UA：列表 / 取链接口都校验它
   const UA_QUARK =
@@ -2437,6 +2437,7 @@
 
   const state = {
     mounted: false,
+    host: null,         // 自己创建的 shadow host，用来识别并清掉重复实例
     open: false,
     platform: null,
     ctx: null,
@@ -3398,14 +3399,21 @@
     * { box-sizing: border-box; }
     .wrap { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
     .fab {
-      position: fixed; right: 22px; bottom: 96px; z-index: 2147483000;
-      width: 54px; height: 54px; border-radius: 18px; cursor: pointer;
+      position: fixed; right: 14px; top: 62vh; z-index: 2147483000;
+      width: 52px; height: 52px; border-radius: 16px; cursor: pointer;
       background: linear-gradient(135deg, #2f7bff, #5b9bff);
       color: #fff; display: flex; align-items: center; justify-content: center;
       box-shadow: 0 10px 26px rgba(27, 92, 214, .38), 0 2px 6px rgba(0,0,0,.12);
-      font-size: 24px; user-select: none; transition: transform .18s ease, opacity .18s ease;
+      font-size: 23px; user-select: none; touch-action: none;
+      transition: transform .18s ease, opacity .18s ease, top .16s ease, left .16s ease, right .16s ease;
     }
+    .fab.left { left: 14px; right: auto; }
     .fab:hover { transform: translateY(-2px) scale(1.03); }
+    /* 拖动中：关掉过渡，跟手；放大一点点给反馈 */
+    .fab.drag { transition: none; transform: scale(1.07); }
+    /* 登录 / 验证码浮层出现时自动让位：淡出且不接收点击，浮层关掉自动回来 */
+    .fab.away { opacity: 0; pointer-events: none; transform: scale(.6) translateX(28px); }
+    .fab.away.left { transform: scale(.6) translateX(-28px); }
     .fab.hide { display: none; }
     .fab .badge {
       position: absolute; top: -6px; right: -6px; min-width: 20px; height: 20px; padding: 0 5px;
@@ -3581,9 +3589,23 @@
     if (state.mounted) return;
     state.mounted = true;
 
+    // 同一个页面被注入两次很常见：浏览器自带脚本引擎 + 油猴各注入一份，
+    // 或者脚本更新后旧实例还挂在页面上。两份都有自己的悬浮球，就变成两个球。
+    // 这里用 window 级标记互斥，并把别人挂的 host 清掉，保证页面上只有一个。
+    try {
+      if (window.__YX_UI__) { return; }
+      window.__YX_UI__ = 1;
+    } catch (e) { /* ignore */ }
+    try {
+      document.querySelectorAll('#yunx-panlink-host').forEach((el) => {
+        try { el.remove(); } catch (e) { /* ignore */ }
+      });
+    } catch (e) { /* ignore */ }
+
     const host = document.createElement('div');
     host.id = 'yunx-panlink-host';
     host.style.cssText = 'position:fixed;inset:0;width:0;height:0;z-index:2147483000';
+    state.host = host;
     const root = host.attachShadow({ mode: 'open' });
 
     const style = document.createElement('style');
@@ -3628,7 +3650,7 @@
             <div class="switch" data-key="autoParse"><i></i></div>
           </div>
           <div class="field">
-            <div><div class="lbl">显示悬浮球</div><div class="desc">关闭后可用油猴菜单「打开直链面板」唤起</div></div>
+            <div><div class="lbl">显示悬浮球</div><div class="desc">按住拖动可换边，位置会记住；登录 / 验证码弹层出现时自动隐藏</div></div>
             <div class="switch" data-key="showBall"><i></i></div>
           </div>
           <div class="field">
@@ -3692,10 +3714,154 @@
     root.appendChild(wrap);
     document.documentElement.appendChild(host);
 
+    bindFabDrag(root);
     bindEvents(root);
     state.settingsOpen = false;
     render();
     applyBall();
+    applyFabPos();
+    watchFabAvoid();
+    watchSoloHost();
+  }
+
+  /* ---------------------- 悬浮球：防重复 / 可拖动 / 自动让位 ---------------------- */
+
+  const FAB_POS_KEY = 'yx_fab_pos';
+  let fabDragged = false;
+
+  // 位置按「贴哪边 + 垂直比例」存，换设备、转屏都能落回合理位置
+  function applyFabPos() {
+    const root = getRoot();
+    if (!root) return;
+    const fab = root.getElementById('yx-fab');
+    if (!fab) return;
+    let pos = null;
+    try { pos = GMStore.get(FAB_POS_KEY, null); } catch (e) { pos = null; }
+    const side = pos && pos.side === 'left' ? 'left' : 'right';
+    let ratio = pos && typeof pos.ratio === 'number' ? pos.ratio : 0.62;
+    ratio = Math.min(0.82, Math.max(0.10, ratio));
+    fab.classList.toggle('left', side === 'left');
+    const h = fab.offsetHeight || 52;
+    fab.style.top = `${Math.round(ratio * window.innerHeight - h / 2)}px`;
+    fab.style.bottom = 'auto';
+    fab.style.left = '';
+    fab.style.right = '';
+  }
+
+  function bindFabDrag(root) {
+    const fab = root.getElementById('yx-fab');
+    if (!fab) return;
+
+    let down = false, moved = false, sx = 0, sy = 0, ox = 0, oy = 0;
+
+    fab.addEventListener('pointerdown', (e) => {
+      down = true;
+      moved = false;
+      const r = fab.getBoundingClientRect();
+      sx = e.clientX;
+      sy = e.clientY;
+      ox = e.clientX - r.left;
+      oy = e.clientY - r.top;
+      try { fab.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+    });
+
+    fab.addEventListener('pointermove', (e) => {
+      if (!down) return;
+      if (!moved && Math.hypot(e.clientX - sx, e.clientY - sy) < 7) return;
+      moved = true;
+      fab.classList.add('drag');
+      const w = fab.offsetWidth || 52;
+      const h = fab.offsetHeight || 52;
+      const x = Math.min(window.innerWidth - w - 2, Math.max(2, e.clientX - ox));
+      const y = Math.min(window.innerHeight - h - 2, Math.max(2, e.clientY - oy));
+      fab.style.left = `${x}px`;
+      fab.style.right = 'auto';
+      fab.style.top = `${y}px`;
+      fab.style.bottom = 'auto';
+    });
+
+    const end = (e) => {
+      if (!down) return;
+      down = false;
+      fab.classList.remove('drag');
+      if (!moved) return;
+      fabDragged = true;
+      const r = fab.getBoundingClientRect();
+      const side = r.left + r.width / 2 < window.innerWidth / 2 ? 'left' : 'right';
+      const ratio = (r.top + r.height / 2) / Math.max(1, window.innerHeight);
+      try { GMStore.set(FAB_POS_KEY, { side, ratio: Math.min(0.82, Math.max(0.10, ratio)) }); } catch (err) { /* ignore */ }
+      applyFabPos();
+    };
+    fab.addEventListener('pointerup', end);
+    fab.addEventListener('pointercancel', end);
+
+    // 拖动结束时浏览器还会补一个 click，必须在这里掐掉，否则一拖就弹出面板
+    fab.addEventListener('click', (e) => {
+      if (!fabDragged) return;
+      fabDragged = false;
+      e.stopImmediatePropagation();
+      e.preventDefault();
+    }, true);
+  }
+
+  // 页面上出现登录框 / 验证码输入时把球收起来，避免挡住输入和「获取验证码」
+  function fabShouldYield() {
+    const sels = [
+      'input[type="password"]',
+      'input[placeholder*="验证码"]',
+      'input[placeholder*="密码"]',
+      'input[placeholder*="口令"]',
+      'input[name*="captcha"]',
+      '[class*="captcha"] input',
+      '[class*="pass-form"] input'
+    ];
+    for (const s of sels) {
+      let list = null;
+      try { list = document.querySelectorAll(s); } catch (e) { continue; }
+      for (const el of list) {
+        if (!el || (el.closest && el.closest('[id^="yunx-panlink"]'))) continue;
+        let r = null;
+        try { r = el.getBoundingClientRect(); } catch (e) { continue; }
+        if (!r || r.width < 24 || r.height < 12) continue;
+        if (r.bottom < 0 || r.top > window.innerHeight) continue;
+        let cs = null;
+        try { cs = getComputedStyle(el); } catch (e) { cs = null; }
+        if (cs && (cs.visibility === 'hidden' || cs.display === 'none' || Number(cs.opacity) < 0.15)) continue;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function watchFabAvoid() {
+    const tick = () => {
+      const root = getRoot();
+      if (!root) return;
+      const fab = root.getElementById('yx-fab');
+      if (!fab) return;
+      if (!settings.showBall) return;
+      let yield_ = false;
+      try { yield_ = fabShouldYield(); } catch (e) { yield_ = false; }
+      fab.classList.toggle('away', yield_);
+    };
+    tick();
+    setInterval(tick, 1200);
+    // 键盘弹出 / 收起、横竖屏切换后视口变了，重新贴边
+    window.addEventListener('resize', () => { applyFabPos(); });
+    window.addEventListener('orientationchange', () => { setTimeout(applyFabPos, 260); });
+  }
+
+  // 同一页面若还有第二个球（另一份脚本挂的），把不是自己的那个清掉
+  function watchSoloHost() {
+    setInterval(() => {
+      let list = null;
+      try { list = document.querySelectorAll('#yunx-panlink-host'); } catch (e) { return; }
+      if (!list || list.length <= 1) return;
+      list.forEach((el) => {
+        if (el === state.host) return;
+        try { el.remove(); } catch (e) { /* ignore */ }
+      });
+    }, 2000);
   }
 
   function bindEvents(root) {
@@ -3874,10 +4040,13 @@
     const fab = root.getElementById('yx-fab');
     if (!fab) return;
     fab.classList.toggle('hide', !settings.showBall);
+    if (settings.showBall) applyFabPos();
   }
 
   function getRoot() {
-    const host = document.getElementById('yunx-panlink-host');
+    // 页面上可能残留别的实例（另一份脚本挂的），优先用自己创建的那个
+    const own = state.host && state.host.isConnected ? state.host : null;
+    const host = own || document.getElementById('yunx-panlink-host');
     return host && host.shadowRoot ? host.shadowRoot : null;
   }
 
