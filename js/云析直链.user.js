@@ -3686,6 +3686,8 @@
   // 在当前层找不到，就逐层往下翻，命中即切（最多翻 12 个目录，避免请求风暴）。
   async function followPageDir(force) {
     if (!state.ctx || !state.platform) return false;
+    // 只有夸克 / UC 是「进目录不换 URL」的 SPA，其余平台 URL 变了会重新解析，不需要这套推断
+    if (state.platform.id !== 'quark' && state.platform.id !== 'uc') return false;
     if (state.navLock && !force) return false;
     if (Date.now() - lastFollowAt < 1200) return false;
 
