@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         云析直链 · 网盘直链下载助手
 // @namespace    https://github.com/CYQawa/YunX
-// @version      1.12.0
+// @version      1.13.0
 // @author       云析直链（YunX 移植）
 // @description  夸克 / UC / 123 / 115 / 天翼 / 移动 / 百度 / 迅雷 / 阿里 / 城通 网盘分享直链解析，附分享页去广告：自动列目录、8 线程分片下载、暂停续传，可导出 IDM / Aria2 / cURL 命令。无口令、无授权码，装上即用。
 // @license      AGPL-3.0-or-later
@@ -11,7 +11,7 @@
 // @downloadURL  https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%90%E7%9B%B4%E9%93%BE.user.js
 // @match        https://pan.quark.cn/
 // @match        https://pan.quark.cn/s/*
-// @match        https://drive.uc.cn/s/*
+// @match        https://drive.uc.cn/*
 // @match        https://www.123865.com/s/*
 // @match        https://www.123pan.com/s/*
 // @match        https://www.123pan.cn/s/*
@@ -35,6 +35,7 @@
 // @match        https://*.ctfile.com/*
 // @match        https://*.ctfile.net/*
 // @match        https://*.545c.com/*
+// @match        https://my.ctfile.com/*
 // @match        https://www.alipan.com/s/*
 // @match        https://www.aliyundrive.com/s/*
 // @exclude      *://*/passport/*
@@ -51,6 +52,7 @@
 // @connect      *.xunlei.com
 // @connect      *.quark.cn
 // @connect      *.uc.cn
+// @connect      pc-api.uc.cn
 // @connect      *.123pan.cn
 // @connect      *.123pan.com
 // @connect      *.123865.com
@@ -62,6 +64,7 @@
 // @connect      *.alipan.com
 // @connect      *.aliyuncs.com
 // @connect      *.ctfile.com
+// @connect      api.ctfile.com
 // @connect      *.ctfile.net
 // @connect      *.545c.com
 // @connect      *.115.com
@@ -735,6 +738,158 @@
     detailMode: 'post',
     downloadUrl: 'https://pc-api.uc.cn/1/clouddrive/file/download?entry=ft&fr=pc&pr=UCBrowser'
   });
+
+  /* ---- UC 个人盘（drive.uc.cn 登录后） ----
+   * 分享页走 /1/clouddrive/transfer_share/* 与 sharepage/*，个人盘走 /1/clouddrive/file/sort
+   * 和 file/download，同一套 pc-api.uc.cn、同一份 Cookie。
+   * 凭据是 Cookie 里的 __puus（HttpOnly，document.cookie 读不到，靠 GM_cookie 读）；
+   * 个人盘取链不需要 stoken / fids_token，只认登录态。
+   */
+  const UC_MINE_PAGE = 100;
+
+  Object.assign(uc, {
+    pickMine(url) {
+      let u;
+      try { u = new URL(url); } catch (e) { return null; }
+      if (u.hostname !== 'drive.uc.cn') return null;
+      if (this.pick(url)) return null;        // /s/xxx 是分享页
+      if (/^\/s\//.test(u.pathname)) return null;
+      return { mine: true };
+    },
+
+    mineKey(cookie) {
+      const m = String(cookie || '').match(/__(?:puus|pus)=([^;]+)/);
+      return m ? m[1] : '';
+    },
+
+    mineHeaders(ctx) {
+      const h = {
+        'User-Agent': UA_UC,
+        'Origin': 'https://drive.uc.cn',
+        'Referer': 'https://drive.uc.cn/',
+        'Content-Type': 'application/json;charset=UTF-8'
+      };
+      if (ctx.cookie) h.Cookie = ctx.cookie;
+      return h;
+    },
+
+    mineError(json) {
+      const code = Number(json && json.code);
+      if (code === 31001 || Number(json && json.status) === 401) {
+        return new Error('UC 网盘登录态无效或已过期：请在 drive.uc.cn 重新登录，然后刷新本页');
+      }
+      if (code === 31023 || code === 31024) {
+        return new Error('UC 接口风控拦截，稍等几分钟再试，或换个网络');
+      }
+      return new Error(apiMessage(json, 'UC 网盘接口返回异常'));
+    },
+
+    async mineInit(ctx) {
+      ctx.mine = true;
+      ctx.cookie = await cookieHeader('https://drive.uc.cn');
+      if (!this.mineKey(ctx.cookie)) {
+        ctx.authFailed = 'expired';
+        throw new Error('读不到 UC 登录态：请先在 drive.uc.cn 登录，然后刷新本页（__puus 是 HttpOnly Cookie，手机浏览器可能读不到，建议用电脑版）');
+      }
+      ctx.title = '我的 UC 网盘';
+      // 昵称只是装饰，接口挂了也要能继续列目录
+      try {
+        const res = await gmRequest({
+          url: 'https://drive.uc.cn/account/info?fr=pc&platform=web',
+          headers: { 'User-Agent': UA_UC, 'Referer': 'https://drive.uc.cn/' }
+        });
+        const j = parseJSON(res, '校验 UC 登录态失败');
+        const d = (j && j.data) || {};
+        const nick = d.nickname || d.nick_name || '';
+        if (nick) { ctx.nick = nick; ctx.title = nick; }
+      } catch (e) { /* ignore */ }
+      ctx.logged = true;
+    },
+
+    async mineList(ctx, dirId) {
+      const out = [];
+      const seen = new Set();
+      const pdir = String(dirId || '0') || '0';
+      for (let page = 1; page <= 50; page++) {
+        const qs = new URLSearchParams({
+          pr: 'UCBrowser',
+          fr: 'pc',
+          pdir_fid: pdir,
+          force: '0',
+          _page: String(page),
+          _size: String(UC_MINE_PAGE),
+          _fetch_total: '1',
+          _fetch_sub_dirs: '0',
+          _sort: 'file_type:asc,updated_at:desc'
+        });
+        const res = await gmRequest({
+          url: `https://pc-api.uc.cn/1/clouddrive/file/sort?${qs.toString()}`,
+          headers: this.mineHeaders(ctx)
+        });
+        const j = parseJSON(res, '读取 UC 网盘目录失败');
+        if (Number(j.status) !== 200) throw this.mineError(j);
+        const d = j.data || {};
+        const arr = d.list || [];
+        for (const it of arr) {
+          const fid = String(it.fid || '');
+          if (!fid || seen.has(fid)) continue;
+          seen.add(fid);
+          out.push({
+            fid,
+            name: it.file_name || '未命名',
+            size: Number(it.size || 0),
+            dir: !!it.dir,
+            token: ''
+          });
+        }
+        if (arr.length < UC_MINE_PAGE) break;
+        await sleep(80);
+      }
+      return out;
+    },
+
+    async mineLink(ctx, file) {
+      const res = await gmRequest({
+        method: 'POST',
+        url: 'https://pc-api.uc.cn/1/clouddrive/file/download?pr=UCBrowser&fr=pc',
+        headers: this.mineHeaders(ctx),
+        data: JSON.stringify({ fids: [String(file.fid)] })
+      });
+      const j = parseJSON(res, '获取 UC 直链失败');
+      if (Number(j.status) !== 200) throw this.mineError(j);
+
+      // 登录态会随响应刷新，跟着换掉手里的 __puus，避免下一次 401
+      const pug = pickCookie(res, '__puus');
+      if (pug) {
+        const val = pug.slice(pug.indexOf('=') + 1);
+        if (/__puus=/.test(ctx.cookie)) ctx.cookie = ctx.cookie.replace(/__puus=[^;]*/g, `__puus=${val}`);
+        else ctx.cookie += `; __puus=${val}`;
+      }
+
+      const it = (j.data && j.data[0]) || {};
+      const url = it.download_url;
+      if (!url) throw new Error('UC 没返回直链，可能触发风控或当日流量已用尽');
+      return {
+        url,
+        headers: { 'User-Agent': UA_UC, 'Referer': 'https://drive.uc.cn/' },
+        guest: false,
+        filename: it.file_name || file.name,
+        size: Number(it.size || file.size || 0)
+      };
+    }
+  });
+
+  // 分享链路保持原样，只在 ctx.mine 时多分一条支路
+  const ucShareList = uc.list.bind(uc);
+  const ucShareLink = uc.link.bind(uc);
+  uc.list = function (ctx, dirId) {
+    if (ctx && ctx.mine) return this.mineList(ctx, dirId);
+    return ucShareList(ctx, dirId);
+  };
+  uc.link = function (ctx, file) {
+    if (ctx && ctx.mine) return this.mineLink(ctx, file);
+    return ucShareLink(ctx, file);
+  };
 
   /* ---------------- 123 云盘 ---------------- */
 
@@ -2675,14 +2830,70 @@
   /* ---------------- 城通网盘 ---------------- */
 
   const CT_API = 'https://urlapi.ctfile.com';
+  const CT_V4 = 'https://api.ctfile.com';
+  const CT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
   function ctHeaders() {
     return {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'User-Agent': CT_UA,
       'Origin': 'https://www.ctfile.com',
       'Referer': 'https://www.ctfile.com/',
       'Accept': 'application/json, text/plain, */*'
     };
+  }
+
+  // 城通新个人盘的 cookie：ctfile_session 里放的是 refresh token（非 HttpOnly，JS 可读）
+  function ctCookie(name) {
+    try {
+      const m = String(document.cookie || '').match(new RegExp('(?:^|;\\s*)' + name + '=([^;]*)'));
+      return m ? decodeURIComponent(m[1]) : '';
+    } catch (e) { return ''; }
+  }
+
+  /**
+   * 换 access token：
+   *   ① 用 ctfile_session 走 /v4/user/auth/refresh-token（rotate_token=false，不轮换、不影响用户自己的登录）
+   *   ② 换不到就退到页面自己存的 sessionStorage.token（900 秒有效）
+   */
+  async function ctAccessToken() {
+    const rt = ctCookie('ctfile_session');
+    if (rt) {
+      try {
+        const res = await gmRequest({
+          method: 'POST',
+          url: `${CT_V4}/v4/user/auth/refresh-token`,
+          headers: {
+            'Content-Type': 'application/json',
+            'Origin': 'https://my.ctfile.com',
+            'Referer': 'https://my.ctfile.com/'
+          },
+          data: JSON.stringify({ refresh_token: rt, rotate_token: false })
+        });
+        const j = parseJSON(res, '城通登录态校验失败');
+        const d = (j && j.data) || {};
+        if (d.token) return String(d.token);
+      } catch (e) { /* 落到 sessionStorage */ }
+    }
+    try {
+      return String(sessionStorage.getItem('token') || '');
+    } catch (e) { return ''; }
+  }
+
+  function ctV4Headers(token) {
+    return {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`,
+      'Origin': 'https://my.ctfile.com',
+      'Referer': 'https://my.ctfile.com/',
+      'Accept-Language': 'zh-CN,zh;q=0.9'
+    };
+  }
+
+  function ctMineError(j) {
+    const code = Number(j && j.code);
+    const msg = (j && (j.message || j.msg)) || '';
+    if (code === 401) return new Error('城通登录态已失效：请重新登录 my.ctfile.com，然后刷新本页');
+    return new Error(msg || `城通接口返回异常（${code}）`);
   }
 
   const ctHex = {
@@ -2770,6 +2981,134 @@
       return { id: m[2], pwd };
     },
 
+    /* ---- 个人网盘（登录后的 my.ctfile.com） ----
+     * 新版个人盘是 React SPA，接口全在 https://api.ctfile.com/v4/*，Bearer 鉴权：
+     *   - 登录后 cookie 写 ctfile_session（refresh token），sessionStorage.token 是 900 秒 access token
+     *   - 列目录 POST /v4/file/browse/list（folder_id：根是 d0，子目录 d<num>）
+     *   - 取链 POST /v4/file/browse/direct-link（file_ids 是去掉 f 前缀的纯数字，逗号分隔）
+     * 直链是会员功能，免费号会被拒，所以失败后回退到「拼分享链接 → 走分享解析」。
+     */
+    pickMine(url) {
+      let u;
+      try { u = new URL(url); } catch (e) { return null; }
+      if (u.hostname !== 'my.ctfile.com') return null;
+      if (/^\/(login|register|recover|terms|privacy)/.test(u.pathname)) return null;
+      return { mine: true };
+    },
+
+    async mineInit(ctx) {
+      ctx.mine = true;
+      ctx.v4Token = await ctAccessToken();
+      if (!ctx.v4Token) {
+        ctx.authFailed = 'expired';
+        throw new Error('读不到城通登录态：请先在 my.ctfile.com 登录，登录完成后刷新本页再试');
+      }
+      ctx.title = '我的城通网盘';
+      try {
+        const res = await gmRequest({
+          url: `${CT_V4}/v4/user/profile/info`,
+          headers: ctV4Headers(ctx.v4Token)
+        });
+        const j = parseJSON(res, '读取城通账号信息失败');
+        if (Number(j.code) === 200) {
+          const d = j.data || j;
+          const d2 = d.user || d;
+          const nick = d2.username || d2.nickname || d2.email || '';
+          if (nick) { ctx.nick = nick; ctx.title = nick; }
+          if (d2.id) ctx.uid = String(d2.id);
+        }
+      } catch (e) { /* 昵称拿不到不影响主流程 */ }
+      ctx.logged = true;
+    },
+
+    async mineList(ctx, dirId) {
+      const out = [];
+      const seen = new Set();
+      // 根目录在城通是 d0；前端规则：以 d 开头就是文件夹，其余补 d
+      let folder = String(dirId == null || dirId === '' ? 'd0' : dirId);
+      if (folder === '0') folder = 'd0';
+      if (folder.charAt(0) !== 'd') folder = 'd' + folder;
+
+      let start = 0;
+      for (let guard = 0; guard < 50; guard++) {
+        const res = await gmRequest({
+          method: 'POST',
+          url: `${CT_V4}/v4/file/browse/list`,
+          headers: ctV4Headers(ctx.v4Token),
+          data: JSON.stringify({ folder_id: folder, start, pagesize: 100 })
+        });
+        const j = parseJSON(res, '读取城通云盘目录失败');
+        if (Number(j.code) !== 200) throw ctMineError(j);
+        const d = j.data || j;
+        const arr = d.results || d.items || [];
+        let added = 0;
+        for (const it of arr) {
+          const fid = String(it.fid || it.key || it.id || '');
+          if (!fid || seen.has(fid)) continue;
+          seen.add(fid);
+          added++;
+          const isDir = it.is_folder === true || it.type === 'folder' ||
+            it.icon === 'folder' || it.ext === 'folder' || fid.charAt(0) === 'd';
+          out.push({
+            fid,
+            name: it.name || '未命名',
+            size: Number(it.size || 0),
+            dir: isDir,
+            token: String(it.userid || it.uid || '')
+          });
+        }
+        const total = Number(d.totalNum || d.total || 0);
+        if (arr.length < 100 || !added) break;
+        start += arr.length;
+        if (total && start >= total) break;
+        await sleep(80);
+      }
+      return out;
+    },
+
+    async mineLink(ctx, file) {
+      const numId = String(file.fid || '').replace(/^[a-z]/i, '');
+
+      // ① 会员直链：最快，计入当月直链流量；免费号会 4xx，直接往下走
+      if (numId) {
+        try {
+          const res = await gmRequest({
+            method: 'POST',
+            url: `${CT_V4}/v4/file/browse/direct-link`,
+            headers: ctV4Headers(ctx.v4Token),
+            data: JSON.stringify({ file_ids: numId })
+          });
+          const j = parseJSON(res, '城通取直链失败');
+          const arr = (j && (j.direct_urls || (j.data && j.data.direct_urls))) || [];
+          const hit = arr[0] || {};
+          if (Number(j.code) === 200 && hit.url) {
+            return {
+              url: hit.url,
+              headers: { 'User-Agent': CT_UA, 'Referer': 'https://my.ctfile.com/' },
+              guest: false,
+              filename: hit.name || file.name,
+              size: Number(file.size || 0),
+              note: '城通直链计入会员当月直链流量，绑定你的 IP，勿外传'
+            };
+          }
+        } catch (e) { /* 免费号走下面 */ }
+      }
+
+      // ② 免费通道：城通文件天然带分享属性，拼出 f/<file_id>-<userid> 再走已验证的分享解析
+      const uid = String(file.token || ctx.uid || ctCookie('ct_uid') || '');
+      if (numId && uid) {
+        const sub = { id: `${numId}-${uid}`, pwd: '', title: '', cookie: '', logged: false };
+        await this.init(sub);
+        const r = await this.link(sub, { fid: sub.id, name: file.name, size: file.size });
+        return Object.assign({}, r, {
+          filename: file.name,
+          size: Number(file.size || r.size || 0),
+          note: '免费通道限速 30KB/s，脚本用多连接分片加速；直链绑定你的 IP，勿外传'
+        });
+      }
+      throw new Error('城通个人盘直链是会员功能；免费号需要文件可被分享（uid 读取失败时无法走免费通道）');
+    },
+
     async init(ctx) {
       // 1. 取 ALTCHA challenge（每次解析都要新的，token 一次性）
       const cr = await gmRequest({
@@ -2808,7 +3147,8 @@
       ctx.logged = false;
     },
 
-    async list(ctx) {
+    async list(ctx, dirId) {
+      if (ctx && ctx.mine) return this.mineList(ctx, dirId);
       const f = ctx.file || {};
       if (!f.file_id) throw new Error('没有读到文件信息');
       return [{
@@ -2821,6 +3161,7 @@
     },
 
     async link(ctx, file) {
+      if (ctx && ctx.mine) return this.mineLink(ctx, file);
       const f = ctx.file || {};
       // verifycode / file_chk 是 resource 那一次响应里下发的，会随请求变化，
       // 必须原样带回来，否则服务端报 "Download signature is invalid"
@@ -3025,13 +3366,13 @@
   }
 
   // 个人盘诊断：登录态 / 根目录 / 首个文件取链，一步步打印，出了问题直接把输出发我
-  // 123 与迅雷共用（两家的接口完全不同，但流程一样）
+  // 123 / 迅雷 / 百度 / UC / 城通 共用（接口各不相同，但流程一样）
   async function diagnoseMine() {
     const p = state.platform && state.platform.pickMine
       ? state.platform
       : PLATFORMS.find((x) => x && x.pickMine && x.pickMine(location.href));
     if (!p || !p.pickMine) {
-      toastRootPush('当前页面不是已支持的个人网盘（目前有 123 云盘、迅雷云盘）', 'warn', 4500);
+      toastRootPush('当前页面不是已支持的个人网盘（123 / 迅雷 / 百度 / UC / 城通）', 'warn', 4500);
       return;
     }
     const ctx = { mine: true, id: '', pwd: '', title: '', logged: false };
@@ -3041,9 +3382,21 @@
     ];
     try {
       if (p.id === 'pan123') ctx.base = 'https://yun.123pan.cn';
-      ctx.token = p.mineToken ? p.mineToken() : '';
-      lines.push(`令牌：${ctx.token ? ctx.token.slice(0, 14) + '…（共 ' + ctx.token.length + ' 字符）' : 'localStorage 里没读到'}`);
-      if (!ctx.token) throw new Error(`没有令牌，先在 ${p.hosts[0]} 完成登录`);
+      if (p.id === 'uc') {
+        ctx.cookie = await cookieHeader('https://drive.uc.cn');
+        const key = p.mineKey ? p.mineKey(ctx.cookie) : '';
+        lines.push(`__puus：${key ? '有（' + key.length + ' 字符）' : '没有，说明当前浏览器没登录 uc'}`);
+      } else if (p.id === 'ctfile') {
+        const rt = ctCookie('ctfile_session');
+        let st = '';
+        try { st = sessionStorage.getItem('token') || ''; } catch (e) { st = ''; }
+        lines.push(`ctfile_session：${rt ? '有（' + rt.length + ' 字符）' : '没有'}`);
+        lines.push(`sessionStorage.token：${st ? '有（' + st.length + ' 字符）' : '没有'}`);
+      } else {
+        ctx.token = p.mineToken ? p.mineToken() : '';
+        lines.push(`令牌：${ctx.token ? ctx.token.slice(0, 14) + '…（共 ' + ctx.token.length + ' 字符）' : 'localStorage 里没读到'}`);
+        if (!ctx.token) throw new Error(`没有令牌，先在 ${p.hosts[0]} 完成登录`);
+      }
       await p.mineInit(ctx);
       const list = await p.mineList(ctx, '0');
       lines.push(`根目录：${list.length} 项 → ${list.slice(0, 5).map((i) => i.name).join(' / ') || '空'}`);
@@ -4336,8 +4689,22 @@
       const is123 = /(^|\.)(123pan\.(cn|com)|123865\.com)$/.test(host);
       const isXL = /(^|\.)xunlei\.com$/.test(host);
       const isBD = host === 'pan.baidu.com';
-      if (!is123 && !isXL && !isBD) return;
+      const isUC = host === 'drive.uc.cn';
+      const isCT = host === 'my.ctfile.com';
+      if (!is123 && !isXL && !isBD && !isUC && !isCT) return;
       const w = (typeof unsafeWindow !== 'undefined' && unsafeWindow) || window;
+      // 城通是 hash 路由（#folder=d123），不靠请求参数，直接听 hashchange 更稳
+      if (isCT) {
+        const readHash = () => {
+          try {
+            const h = String(location.hash || '').replace(/^#/, '');
+            const f = new URLSearchParams(h).get('folder');
+            if (f) pageMineDir = f;
+          } catch (e) { /* ignore */ }
+        };
+        readHash();
+        try { w.addEventListener('hashchange', readHash); } catch (e) { /* ignore */ }
+      }
       if (!w || w.__yxMineHooked) return;
       w.__yxMineHooked = 1;
       const grab = (u) => {
@@ -4346,6 +4713,11 @@
         if (/[?&]access_token=/.test(s)) return;
         const m123 = s.match(/[?&]parentFileId=(\d+)/);
         if (m123) { pageMineDir = m123[1]; return; }
+        if (isUC && /\/1\/clouddrive\/file\/sort(\?|$)/.test(s)) {
+          const mu = s.match(/[?&]pdir_fid=([A-Za-z0-9_-]*)/);
+          if (mu) pageMineDir = mu[1] || '0';
+          return;
+        }
         if (isBD && /\/api\/list(\?|$)/.test(s)) {
           const mb = s.match(/[?&]dir=([^&]*)/);
           if (mb) {
@@ -4378,7 +4750,7 @@
   async function followMineDir(force) {
     if (!state.ctx || !state.ctx.mine || !state.platform) return false;
     if (state.navLock && !force) return false;
-    if (!pageMineDir || pageMineDir === '0' || pageMineDir === '/') return false;
+    if (!pageMineDir || pageMineDir === '0' || pageMineDir === '/' || pageMineDir === 'd0') return false;
     const top = state.stack[state.stack.length - 1];
     if (top && top.id === pageMineDir) return false;
     if (Date.now() - lastFollowAt < 1500) return false;

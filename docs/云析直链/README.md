@@ -55,14 +55,14 @@ https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%
 > 注意：镜像会把文件里的 `github.com` 改写成自己的域，`@namespace` 跟着变，篡改猴可能提示「脚本已存在，是否覆盖」——点覆盖即可，仍然是一个脚本。
 > 镜像响应不带 `Access-Control-Allow-Origin`，浏览器跨域读不了，所以**不能**当自动检查更新的数据源。
 
-### 运行范围（v1.9.0 收窄，v1.12.0 起 123 / 迅雷 / 百度 个人盘也接管）
+### 运行范围（v1.9.0 收窄，v1.13.0 起 123 / 迅雷 / 百度 / UC / 城通 个人盘也接管）
 
 早期版本是「域名级全站匹配」，连会员页、支付页都会挂悬浮球。现在只在**分享页**和**已支持的个人网盘**注入：
 
 | 平台 | 启用的路径 |
 | --- | --- |
 | 夸克 | `pan.quark.cn/`、`pan.quark.cn/s/*` |
-| UC | `drive.uc.cn/s/*` |
+| UC（分享 + 个人盘） | `drive.uc.cn/*`（`/s/*` 走分享，其余走个人盘，v1.13.0） |
 | 123 云盘（分享） | `www.123865.com/s/*`、`www.123pan.com/s/*`、`www.123pan.cn/s/*`、`share.123pan.cn/123pan/*` |
 | 123 云盘（个人盘） | `yun.123pan.cn/*`、`yun.123pan.com/*`、`www.123865.com/*`（登录后的盘，v1.10.0） |
 | 115 | `115.com/s/*`、`115cdn.com/s/*`、`115rc.com/s/*` |
@@ -72,7 +72,7 @@ https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%
 | 百度（个人盘） | `pan.baidu.com/disk/*`（登录后的盘，v1.12.0） |
 | 迅雷（分享 + 个人盘） | `pan.xunlei.com/*`（`/s/*` 走分享，其余走个人盘，v1.11.0） |
 | 阿里 | `www.alipan.com/s/*`、`www.aliyundrive.com/s/*` |
-| 城通 | `*.ctfile.com/*`、`*.ctfile.net/*`、`*.545c.com/*` |
+| 城通（分享 + 个人盘） | `*.ctfile.com/*`、`*.ctfile.net/*`、`*.545c.com/*`；`my.ctfile.com/*` 走个人盘（v1.13.0） |
 
 另外统一排除：`/passport/*`、`/register*`、`/reg.html*`、`/vip*`、`/pay*`、`/about/*`、`/help*`。
 
@@ -96,20 +96,20 @@ https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%
 
 面板里手动改过选择后，页面同步会暂停，不会把你刚改的覆盖掉；关掉重开面板会重新对齐。
 
-### 个人网盘：123 / 迅雷 / 百度（v1.10.0 ~ v1.12.0）
+### 个人网盘：123 / 迅雷 / 百度 / UC / 城通（v1.10.0 ~ v1.13.0）
 
-之前只在**分享页**干活，自己盘里的文件读不到。现在这三家的登录后页面也接管了：
+之前只在**分享页**干活，自己盘里的文件读不到。现在这五家的登录后页面也接管了：
 
-| 动作 | 123 云盘 | 迅雷云盘 | 百度网盘 |
-| --- | --- | --- | --- |
-| 页面 | `yun.123pan.cn` | `pan.xunlei.com` | `pan.baidu.com/disk/main` |
-| 面板标题 | 你的昵称 | 「我的迅雷云盘」 | 你的百度昵称 |
-| 列目录 / 下钻 / 返回 | ✅ | ✅ | ✅ |
-| 页面勾选 → 面板同步 | ✅ | ✅ | ✅ |
-| 跟随页面所在目录 | ✅ `parentFileId` | ✅ `parent_id` | ✅ `/api/list` 的 `dir` |
-| 下载 / 复制直链 | ✅ | ✅ | ✅（有令牌时自动走分片引擎） |
-| 刷新当前目录 | ✅ | ✅ | ✅ |
-| 需要额外授权 | 否（读网页登录态） | 否（读网页登录态） | **是**，点「一键授权百度网盘」 |
+| 动作 | 123 云盘 | 迅雷云盘 | 百度网盘 | UC 网盘 | 城通网盘 |
+| --- | --- | --- | --- | --- | --- |
+| 页面 | `yun.123pan.cn` | `pan.xunlei.com` | `pan.baidu.com/disk/main` | `drive.uc.cn` | `my.ctfile.com` |
+| 面板标题 | 你的昵称 | 「我的迅雷云盘」 | 你的百度昵称 | 你的 UC 昵称 | 你的城通昵称 |
+| 列目录 / 下钻 / 返回 | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 页面勾选 → 面板同步 | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 跟随页面所在目录 | ✅ `parentFileId` | ✅ `parent_id` | ✅ `/api/list` 的 `dir` | ✅ `pdir_fid` | ✅ hash `#folder=` |
+| 下载 / 复制直链 | ✅ | ✅ | ✅（有令牌时自动走分片引擎） | ✅ | ✅（会员走直连，免费号回退分享解析） |
+| 刷新当前目录 | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 需要额外授权 | 否（读网页登录态） | 否（读网页登录态） | **是**，点「一键授权百度网盘」 | 否（读网页 Cookie） | 否（读网页 Cookie） |
 
 取链走的接口：
 
@@ -118,6 +118,12 @@ https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%
 | 123 | `/api/file/list/new` | `POST /api/file/download_info` | `localStorage.accessToken` |
 | 迅雷 | `drive/v1/files?parent_id=…` | `drive/v1/files/{id}?_magic=2021&usage=PLAY` | `localStorage.credentials_<client_id>.access_token` |
 | 百度 | `xpan/file?method=list&dir=…` | `xpan/multimedia?method=filemetas&dlink=1&fsids=[…]` | 「一键授权」拿到的 access_token（30 天） |
+| UC | `pc-api.uc.cn/1/clouddrive/file/sort?pdir_fid=…` | `POST /1/clouddrive/file/download`（只传 `fids`） | Cookie `__puus`（HttpOnly，靠 `GM_cookie` 读） |
+| 城通 | `POST api.ctfile.com/v4/file/browse/list` | `POST /v4/file/browse/direct-link` | 网页 Cookie `ctfile_session` → 换 900 秒 access token |
+
+UC 和夸克的分享页共用一套 `clouddrive` 协议，个人盘只是换了两条路径：`file/sort` 列目录、`file/download` 传纯 `fids`（分享页那套要 `fids_token` + `stoken`，个人盘不要）。所以 UC 的代码是在分享适配器上加了 `mine*` 分支，分享链路一个字没动。
+
+城通这边要说明白：新版个人盘（`my.ctfile.com`）是 React SPA，接口全在 `api.ctfile.com/v4/*`，`Bearer` 鉴权。脚本用 Cookie 里的 `ctfile_session`（refresh token）去换 access token，**`rotate_token` 传 `false`**，不轮换、不把你自己浏览器里的登录态顶掉。直链是会员功能（标准会员起），免费号会 403 —— 这时脚本回退到「拼出 `f/<file_id>-<userid>` 分享地址 → 走已验证的分享解析」，也就是免费通道（限速 30KB/s，多连接分片加速）。
 
 百度为什么单独要授权：2023 年起官方关了游客取链，网页版下载接口改成 `sign` + `timestamp` + `bdstoken` 动态签名，跟着前端改版就废；
 开放平台 OAuth 的 `access_token` 反而稳定，列目录和取链都只认它。所以个人盘沿用分享页那套授权，**不读你的 BDUSS**，
@@ -141,7 +147,30 @@ https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%
 取链：成功「电影.mkv」→ https://d.pcs.baidu.com/file/…
 ```
 
-> 目前个人盘支持 **123 云盘 / 迅雷云盘 / 百度网盘**。夸克 / UC / 阿里 的个人盘是另外的接口（`__puus`、`/file/download`、`/v2/file/list` 等），还没接——分享页那套照旧能用。要接的话同样需要你能现场登录验证，否则只能停在「看起来能用」。
+UC 与城通的诊断输出不一样（它们不靠 localStorage 令牌）：
+
+```
+页面：drive.uc.cn/main
+平台：UC 网盘
+__puus：有（192 字符）
+根目录：8 项 → 电影 / 相册 / 备份.zip / …
+取链：成功「电影.mkv」→ https://cdn.uc…
+```
+
+```
+页面：my.ctfile.com/
+平台：城通网盘
+ctfile_session：有（64 字符）
+sessionStorage.token：有（312 字符）
+根目录：6 项 → 资料.zip / 备份 / …
+取链：成功「资料.zip」→ https://cdn.ctfile…
+```
+
+> 目前个人盘支持 **123 云盘 / 迅雷云盘 / 百度网盘 / UC 网盘 / 城通网盘**。
+> 还没接的：夸克个人盘（接口与 UC 同构，改个域名和 `pr` 参数即可，缺的是现场登录验证）、阿里个人盘（`/v2/file/list` + `x-device-id` 签名）、115 / 天翼 / 移动的个人盘。
+> 这类新平台一律要能现场登录跑通才算数，否则只能停在「看起来能用」。
+>
+> 城通额外提醒：直链是**会员功能**，免费号走的是「分享解析」回退；如果文件本身被设为不公开分享，回退也会失败，会直接说明原因。
 
 ### 登录态怎么认（v1.9.2）
 
@@ -223,7 +252,9 @@ https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%
 | 迅雷云盘 `pan.xunlei.com/s/xxx` | ✅ 游客可浏览全目录 | ⚠️ 下载需登录（转存后取链） | 9 层 md5 换 `X-Captcha-Token`，匿名可列目录，`web_content_link` 匿名为空 |
 | 迅雷个人盘 `pan.xunlei.com/` | ✅ 登录后直接列自己的文件 | ✅ 支持 | 与分享页同一套签名，`files` 接口 + `credentials_*.access_token` |
 | 百度个人盘 `pan.baidu.com/disk/main` | ✅ 授权后列自己的文件 | ✅ 支持 | xpan `file/list` + `filemetas`，OAuth access_token（30 天），不读 BDUSS |
+| UC 个人盘 `drive.uc.cn/` | ✅ 登录后直接列自己的文件 | ✅ 支持 | `file/sort` + `file/download`（只传 `fids`），凭据是 HttpOnly Cookie `__puus` |
 | 城通网盘 `url95.ctfile.com/f/xxx` | ✅ 游客 | ✅ 游客 | ALTCHA-PBKDF2 人机验证本地可解（0.5s）；单连接限速 30KB/s，多连接实测 8 路 1.4MB/s |
+| 城通个人盘 `my.ctfile.com` | ✅ 登录后直接列自己的文件 | ⚠️ 会员走直连 / 免费号回退分享解析 | `v4/file/browse/list`；直链 `direct-link` 是会员功能，失败自动拼 `f/<id>-<uid>` 走分享链路 |
 
 > **「需登录」是什么意思**：脚本在你已经登录的网盘页面里运行，用同源请求自动带上浏览器里的登录 Cookie —— 你不需要在弹出的面板里再输一次账号，也不会有任何账号信息离开你的浏览器。没登录时脚本会直接告诉你「请先在 xxx 登录」，不会假装成功。
 
@@ -497,7 +528,7 @@ v1.9.1 起球可以**按住拖动**，松手自动吸附到左边或右边，位
 新版挂载时会清掉页面上多余的实例，但脚本管理器里的那份要自己去删。
 
 **为什么网盘首页没有悬浮球了？**
-v1.9.0 起只在分享页注入（`/s/…`、`/t/…`、`/f/…`），会员页不再运行。v1.10.0 放开 123 个人盘，v1.11.0 放开迅雷个人盘（并把登录页从排除项里拿掉，未登录也能看到球和提示），v1.12.0 放开百度个人盘；其余平台的个人盘仍然不接管——要解析分享链接，直接打开分享页即可。
+v1.9.0 起只在分享页注入（`/s/…`、`/t/…`、`/f/…`），会员页不再运行。v1.10.0 放开 123 个人盘，v1.11.0 放开迅雷个人盘（并把登录页从排除项里拿掉，未登录也能看到球和提示），v1.12.0 放开百度个人盘，v1.13.0 放开 UC（`drive.uc.cn`）和城通（`my.ctfile.com`）个人盘；夸克 / 阿里 / 115 / 天翼 / 移动的个人盘仍然不接管——要解析分享链接，直接打开分享页即可。
 
 **检查更新报「拉取失败 / 网络不通」？**
 v1.9.3 起会自动按 `raw → ghproxy.net → ghfast.top → jsDelivr` 依次重试，四个全挂才会报错，报错里会带上每个源各自的原因。
