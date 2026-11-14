@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         云析直链 · 网盘直链下载助手
 // @namespace    https://github.com/CYQawa/YunX
-// @version      1.11.0
+// @version      1.12.0
 // @author       云析直链（YunX 移植）
 // @description  夸克 / UC / 123 / 115 / 天翼 / 移动 / 百度 / 迅雷 / 阿里 / 城通 网盘分享直链解析，附分享页去广告：自动列目录、8 线程分片下载、暂停续传，可导出 IDM / Aria2 / cURL 命令。无口令、无授权码，装上即用。
 // @license      AGPL-3.0-or-later
@@ -28,6 +28,7 @@
 // @match        https://caiyun.139.com/*
 // @match        https://pan.baidu.com/s/*
 // @match        https://pan.baidu.com/share/*
+// @match        https://pan.baidu.com/disk/*
 // @match        https://yun.baidu.com/s/*
 // @match        https://openapi.baidu.com/oauth/*
 // @match        https://pan.xunlei.com/*
@@ -90,7 +91,7 @@
    * 0. 常量
    * ===================================================================== */
 
-  const APP = { name: '云析直链', version: '1.11.0' };
+  const APP = { name: '云析直链', version: '1.12.0' };
 
   // 夸克 PC 客户端 UA：列表 / 取链接口都校验它
   const UA_QUARK =
@@ -1580,6 +1581,94 @@
       return { id: m[1], pwd };
     },
 
+    /* ---- 个人网盘（登录后的 pan.baidu.com/disk/*） ----
+     * 列目录走 xpan 开放接口（只认 access_token，不吃 bdstoken，接口比网页版稳）；
+     * 取链同样用 filemetas，dlink 必须追加 access_token，下载还要 UA：pan.baidu.com。
+     * 令牌来自「一键授权」（30 天），没有令牌时面板会直接给授权按钮。
+     */
+    pickMine(url) {
+      let u;
+      try { u = new URL(url); } catch (e) { return null; }
+      if (u.hostname !== 'pan.baidu.com') return null;
+      if (this.pick(url)) return null;
+      if (!/^\/disk(\/|$)/.test(u.pathname)) return null;
+      return { mine: true };
+    },
+
+    mineToken() {
+      return this.token();
+    },
+
+    async mineInit(ctx) {
+      ctx.mine = true;
+      ctx.token = this.token();
+      ctx.title = '我的百度网盘';
+      if (!ctx.token) {
+        ctx.authFailed = 'none';
+        throw new Error('百度个人盘需要授权：点下面「一键授权百度网盘」，一次授权 30 天有效（列目录和取链都用它）');
+      }
+      const info = await this.verifyToken();
+      if (!info) {
+        ctx.authFailed = 'expired';
+        throw new Error('百度访问令牌已失效：请重新点「一键授权百度网盘」，授权后刷新页面');
+      }
+      ctx.nick = info.baidu_name || info.netdisk_name || '';
+      if (ctx.nick) ctx.title = ctx.nick;
+      ctx.logged = true;
+    },
+
+    async mineList(ctx, dirId) {
+      const token = this.token();
+      if (!token) throw new Error('百度个人盘需要授权：请点「一键授权百度网盘」');
+      let dir = String(dirId == null || dirId === '' ? '/' : dirId);
+      if (dir === '0') dir = '/';
+      if (dir.charAt(0) !== '/') dir = '/' + dir;
+      const out = [];
+      for (let start = 0, guard = 0; guard < 50; guard++, start += 1000) {
+        const url = 'https://pan.baidu.com/rest/2.0/xpan/file?method=list' +
+          `&access_token=${encodeURIComponent(token)}&dir=${encodeURIComponent(dir)}` +
+          `&order=name&start=${start}&limit=1000&web=1`;
+        const j = await this._xpan(url);
+        const code = Number(j.errno);
+        if (code === 31045 || code === -6) {
+          GMStore.set(BAIDU_TOKEN_KEY, '');
+          ctx.logged = false;
+          ctx.authFailed = true;
+          throw new Error('百度访问令牌已失效，已自动清除，请重新「一键授权百度网盘」');
+        }
+        if (code !== 0) throw new Error(j.errmsg || `百度列目录失败（errno ${code}）`);
+        const arr = j.list || [];
+        for (const it of arr) {
+          const isDir = Number(it.isdir) === 1;
+          out.push({
+            fid: isDir ? String(it.path || '') : String(it.fs_id),
+            name: it.server_filename || '未命名',
+            size: Number(it.size || 0),
+            dir: isDir,
+            token: String(it.path || '')
+          });
+        }
+        if (arr.length < 1000) break;
+        await sleep(80);
+      }
+      return out;
+    },
+
+    async mineLink(ctx, file) {
+      const token = this.token();
+      if (!token) throw new Error('百度取链需要授权：请点「一键授权百度网盘」');
+      const url = await this._dlinkByToken(file.fid);
+      if (!url) throw new Error('百度未返回 dlink');
+      return {
+        url,
+        headers: { 'User-Agent': BAIDU_DL_UA, 'Referer': 'https://pan.baidu.com/' },
+        guest: false,
+        filename: file.name,
+        size: Number(file.size || 0),
+        note: '个人盘直链约 8 小时有效（下载须带 UA：pan.baidu.com）'
+      };
+    },
+
     _cookie(ctx) {
       const parts = [];
       if (ctx.cookie) parts.push(ctx.cookie);
@@ -1862,6 +1951,7 @@
     },
 
     async list(ctx, dirId) {
+      if (ctx && ctx.mine) return this.mineList(ctx, dirId);
       if (!ctx.logged) this._needLogin();
       if (!ctx.sekey && ctx.pwd) await this._verify(ctx);
       const dir = !dirId || dirId === '0' ? '/' : dirId;
@@ -1972,6 +2062,7 @@
     },
 
     async link(ctx, file) {
+      if (ctx && ctx.mine) return this.mineLink(ctx, file);
       const hasToken = this.hasToken();
       if (!ctx.logged && !hasToken) {
         throw new Error('百度已关闭游客取链：请在本页登录百度账号后刷新重试。登录后走「免转存」通道，不会往你网盘写任何文件');
@@ -2312,7 +2403,7 @@
         });
         const j = parseJSON(res, '读取迅雷云盘目录失败');
         if (j && j.error) {
-          if (j.error === 'unauthenticated') { ctx.logged = false; ctx.authFailed = true; }
+          if (j.error === 'unauthenticated') { ctx.logged = false; ctx.authFailed = 'expired'; }
           throw this.mineFail(j);
         }
         const data = j.data || j;
@@ -2345,7 +2436,7 @@
       });
       const j = parseJSON(res, '获取迅雷直链失败');
       if (j && j.error) {
-        if (j.error === 'unauthenticated') { ctx.logged = false; ctx.authFailed = true; }
+        if (j.error === 'unauthenticated') { ctx.logged = false; ctx.authFailed = 'expired'; }
         throw this.mineFail(j);
       }
       const d = j.data || j;
@@ -2984,7 +3075,8 @@
         if (me) {
           toastRootPush(`已授权：${me.netdisk_name || me.baidu_name || '百度网盘'}，正在重新解析…`);
           state.links.clear();
-          if (state.shareUrl) await parseShare(state.shareUrl);
+          if (state.mine) await reloadMine();
+          else if (state.shareUrl) await parseShare(state.shareUrl);
           else render();
           return;
         }
@@ -3001,7 +3093,8 @@
         toastRootPush(`授权成功：${me.netdisk_name || me.baidu_name || '已授权'}，正在重新解析…`);
       }
       state.links.clear();
-      if (state.shareUrl) await parseShare(state.shareUrl);
+      if (state.mine) await reloadMine();
+      else if (state.shareUrl) await parseShare(state.shareUrl);
       else render();
     } catch (e) {
       toastRootPush(e.message || '授权失败', 'err');
@@ -4242,14 +4335,24 @@
       const host = location.hostname;
       const is123 = /(^|\.)(123pan\.(cn|com)|123865\.com)$/.test(host);
       const isXL = /(^|\.)xunlei\.com$/.test(host);
-      if (!is123 && !isXL) return;
+      const isBD = host === 'pan.baidu.com';
+      if (!is123 && !isXL && !isBD) return;
       const w = (typeof unsafeWindow !== 'undefined' && unsafeWindow) || window;
       if (!w || w.__yxMineHooked) return;
       w.__yxMineHooked = 1;
       const grab = (u) => {
         const s = String(u || '');
+        // 脚本自己发的 xpan 请求带 access_token，别当成页面导航，否则会自己跟丢自己
+        if (/[?&]access_token=/.test(s)) return;
         const m123 = s.match(/[?&]parentFileId=(\d+)/);
         if (m123) { pageMineDir = m123[1]; return; }
+        if (isBD && /\/api\/list(\?|$)/.test(s)) {
+          const mb = s.match(/[?&]dir=([^&]*)/);
+          if (mb) {
+            try { pageMineDir = decodeURIComponent(mb[1] || '/'); } catch (e) { pageMineDir = mb[1] || '/'; }
+          }
+          return;
+        }
         if (isXL && /\/drive\/v1\/files(\?|$)/.test(s)) {
           const mx = s.match(/[?&]parent_id=([A-Za-z0-9_-]*)/);
           if (mx) pageMineDir = mx[1] || '';   // 空串 = 页面回到了根目录
@@ -4275,7 +4378,7 @@
   async function followMineDir(force) {
     if (!state.ctx || !state.ctx.mine || !state.platform) return false;
     if (state.navLock && !force) return false;
-    if (!pageMineDir || pageMineDir === '0') return false;
+    if (!pageMineDir || pageMineDir === '0' || pageMineDir === '/') return false;
     const top = state.stack[state.stack.length - 1];
     if (top && top.id === pageMineDir) return false;
     if (Date.now() - lastFollowAt < 1500) return false;
@@ -4893,7 +4996,8 @@
       const nick = state.ctx.nick ? String(state.ctx.nick).trim().slice(0, 10) : '';
       tag.textContent = tok ? '已授权'
         : (state.ctx.logged ? (nick || '已登录')
-          : (state.ctx.authFailed ? '登录失效' : (state.platform.guestLabel || '游客')));
+          : (state.ctx.authFailed ? (state.ctx.authFailed === 'none' ? '未授权' : '登录失效')
+            : (state.platform.guestLabel || '游客')));
       tag.className = 'tag' + (tok || state.ctx.logged ? '' : ' guest');
     } else {
       tag.style.display = 'none';
@@ -5031,7 +5135,7 @@
       const relogin = box.querySelector('#yx-relogin');
       const pwd = box.querySelector('#yx-pwd');
       const authBtn = box.querySelector('#yx-auth');
-      const again = () => parseShare(state.shareUrl || location.href, pwd ? pwd.value : '');
+      const again = () => (state.mine ? reloadMine() : parseShare(state.shareUrl || location.href, pwd ? pwd.value : ''));
       if (retry) retry.addEventListener('click', again);
       if (relogin) relogin.addEventListener('click', again);
       if (authBtn) authBtn.addEventListener('click', doBaiduAuth);

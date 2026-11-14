@@ -55,7 +55,7 @@ https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%
 > 注意：镜像会把文件里的 `github.com` 改写成自己的域，`@namespace` 跟着变，篡改猴可能提示「脚本已存在，是否覆盖」——点覆盖即可，仍然是一个脚本。
 > 镜像响应不带 `Access-Control-Allow-Origin`，浏览器跨域读不了，所以**不能**当自动检查更新的数据源。
 
-### 运行范围（v1.9.0 收窄，v1.11.0 起 123 / 迅雷 个人盘也接管）
+### 运行范围（v1.9.0 收窄，v1.12.0 起 123 / 迅雷 / 百度 个人盘也接管）
 
 早期版本是「域名级全站匹配」，连会员页、支付页都会挂悬浮球。现在只在**分享页**和**已支持的个人网盘**注入：
 
@@ -68,7 +68,8 @@ https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%
 | 115 | `115.com/s/*`、`115cdn.com/s/*`、`115rc.com/s/*` |
 | 天翼 | `cloud.189.cn/t/*`、`cloud.189.cn/web/share*` |
 | 移动 | `yun.139.com/*`、`caiyun.139.com/*`（分享走 hash 路由，路径太多，保留全域） |
-| 百度 | `pan.baidu.com/s/*`、`pan.baidu.com/share/*`、`yun.baidu.com/s/*`、`openapi.baidu.com/*`（授权页） |
+| 百度（分享） | `pan.baidu.com/s/*`、`pan.baidu.com/share/*`、`yun.baidu.com/s/*`、`openapi.baidu.com/*`（授权页） |
+| 百度（个人盘） | `pan.baidu.com/disk/*`（登录后的盘，v1.12.0） |
 | 迅雷（分享 + 个人盘） | `pan.xunlei.com/*`（`/s/*` 走分享，其余走个人盘，v1.11.0） |
 | 阿里 | `www.alipan.com/s/*`、`www.aliyundrive.com/s/*` |
 | 城通 | `*.ctfile.com/*`、`*.ctfile.net/*`、`*.545c.com/*` |
@@ -95,19 +96,20 @@ https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%
 
 面板里手动改过选择后，页面同步会暂停，不会把你刚改的覆盖掉；关掉重开面板会重新对齐。
 
-### 个人网盘：123 与迅雷（v1.10.0 / v1.11.0）
+### 个人网盘：123 / 迅雷 / 百度（v1.10.0 ~ v1.12.0）
 
-之前只在**分享页**干活，自己盘里的文件读不到。现在这两家的登录后页面也接管了：
+之前只在**分享页**干活，自己盘里的文件读不到。现在这三家的登录后页面也接管了：
 
-| 动作 | 123 云盘 | 迅雷云盘 |
-| --- | --- | --- |
-| 打开并登录 | `yun.123pan.cn` | `pan.xunlei.com` |
-| 面板标题 | 你的昵称 | 「我的迅雷云盘」 |
-| 列目录 / 下钻 / 返回 | ✅ | ✅ |
-| 页面里勾选 → 面板同步 | ✅ | ✅（按行文本匹配文件名） |
-| 跟随页面所在目录 | ✅ 记列表请求里的 `parentFileId` | ✅ 记列表请求里的 `parent_id` |
-| 下载 / 复制直链 | ✅ 分片引擎 + 直链 | ✅ |
-| 刷新当前目录 | ✅ | ✅ |
+| 动作 | 123 云盘 | 迅雷云盘 | 百度网盘 |
+| --- | --- | --- | --- |
+| 页面 | `yun.123pan.cn` | `pan.xunlei.com` | `pan.baidu.com/disk/main` |
+| 面板标题 | 你的昵称 | 「我的迅雷云盘」 | 你的百度昵称 |
+| 列目录 / 下钻 / 返回 | ✅ | ✅ | ✅ |
+| 页面勾选 → 面板同步 | ✅ | ✅ | ✅ |
+| 跟随页面所在目录 | ✅ `parentFileId` | ✅ `parent_id` | ✅ `/api/list` 的 `dir` |
+| 下载 / 复制直链 | ✅ | ✅ | ✅（有令牌时自动走分片引擎） |
+| 刷新当前目录 | ✅ | ✅ | ✅ |
+| 需要额外授权 | 否（读网页登录态） | 否（读网页登录态） | **是**，点「一键授权百度网盘」 |
 
 取链走的接口：
 
@@ -115,28 +117,31 @@ https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%
 | --- | --- | --- | --- |
 | 123 | `/api/file/list/new` | `POST /api/file/download_info` | `localStorage.accessToken` |
 | 迅雷 | `drive/v1/files?parent_id=…` | `drive/v1/files/{id}?_magic=2021&usage=PLAY` | `localStorage.credentials_<client_id>.access_token` |
+| 百度 | `xpan/file?method=list&dir=…` | `xpan/multimedia?method=filemetas&dlink=1&fsids=[…]` | 「一键授权」拿到的 access_token（30 天） |
 
-迅雷那套与分享页**同一套 captcha 签名**（`action = METHOD:path`，9 层 md5 换 `X-Captcha-Token`），只是把 `share` 换成 `files`，所以不用另外逆向。
+百度为什么单独要授权：2023 年起官方关了游客取链，网页版下载接口改成 `sign` + `timestamp` + `bdstoken` 动态签名，跟着前端改版就废；
+开放平台 OAuth 的 `access_token` 反而稳定，列目录和取链都只认它。所以个人盘沿用分享页那套授权，**不读你的 BDUSS**，
+也不会往你网盘写任何东西（不像分享直下要转存）。
 
 几点要知道：
 
-- **凭据**：只用你浏览器里那份令牌，脚本不存第二份、也不上送别处。换浏览器、无痕窗口、清了站点数据，都要重新登录。
-- **失效表现**：面板直接写「登录态已失效：请在 … 重新登录，然后刷新页面」，标签变成「登录失效」，不会含糊成「网络错误」。
+- **凭据**：123 / 迅雷读浏览器登录态；百度用授权令牌。脚本不存第二份、不上送别处。换浏览器、无痕、清站点数据都要重来。
+- **失效表现**：标签直接变「登录失效」或「未授权」，副标题写清下一步点哪里，不会含糊成「网络错误」。
 - **去广告规则不在这类页面注入**：`[class^="ad-"]` 那类选择器在自己文件列表上有误伤风险，个人盘直接跳过。
 - **取链仍受服务端策略约束**：当日流量、会员限速、风控都在平台那边，拿不到会说明是哪一步被拦。
-- **迅雷直链防盗链**：下载走浏览器直下，部分文件可能 403；这时用「复制直链」丢给 IDM / aria2，并带上 `Referer: https://pan.xunlei.com/`。
+- **百度直链时效**：dlink 约 8 小时，且必须带 `access_token`（脚本已拼好）+ UA `pan.baidu.com`；下载走分片引擎时会自动带。
 
 出问题不用截图猜，菜单里「🔍 诊断当前网盘」会依次打印平台、令牌长度、根目录前几项、第一个文件的取链结果，并自动复制到剪贴板：
 
 ```
-页面：pan.xunlei.com/
-平台：迅雷云盘
-令牌：eyJhbGciOiJSUzI1…（共 1024 字符）
+页面：pan.baidu.com/disk/main
+平台：百度网盘
+令牌：123.abcdef…（共 96 字符）
 根目录：12 项 → 电影 / 相册 / 备份.zip / …
-取链：成功「电影.mkv」→ https://dl-…
+取链：成功「电影.mkv」→ https://d.pcs.baidu.com/file/…
 ```
 
-> 目前个人盘支持 **123 云盘** 和 **迅雷云盘**。夸克 / UC / 阿里 / 百度的个人盘是另外的接口（`__puus`、`/file/download`、`/v2/file/list` 等），还没接——分享页那套照旧能用。要接的话同样需要你能现场登录验证，否则只能停在「看起来能用」。
+> 目前个人盘支持 **123 云盘 / 迅雷云盘 / 百度网盘**。夸克 / UC / 阿里 的个人盘是另外的接口（`__puus`、`/file/download`、`/v2/file/list` 等），还没接——分享页那套照旧能用。要接的话同样需要你能现场登录验证，否则只能停在「看起来能用」。
 
 ### 登录态怎么认（v1.9.2）
 
@@ -217,6 +222,7 @@ https://raw.githubusercontent.com/zjkl0330/tampermonkey/main/js/%E4%BA%91%E6%9E%
 | 百度网盘 `pan.baidu.com/s/1xxx` | ⚠️ 列目录需登录 | ✅ 授权后可用 | 一键 OAuth 拿 `access_token` → `xpan/multimedia?method=filemetas`；下载必须 `UA: pan.baidu.com` + `access_token` 参数 |
 | 迅雷云盘 `pan.xunlei.com/s/xxx` | ✅ 游客可浏览全目录 | ⚠️ 下载需登录（转存后取链） | 9 层 md5 换 `X-Captcha-Token`，匿名可列目录，`web_content_link` 匿名为空 |
 | 迅雷个人盘 `pan.xunlei.com/` | ✅ 登录后直接列自己的文件 | ✅ 支持 | 与分享页同一套签名，`files` 接口 + `credentials_*.access_token` |
+| 百度个人盘 `pan.baidu.com/disk/main` | ✅ 授权后列自己的文件 | ✅ 支持 | xpan `file/list` + `filemetas`，OAuth access_token（30 天），不读 BDUSS |
 | 城通网盘 `url95.ctfile.com/f/xxx` | ✅ 游客 | ✅ 游客 | ALTCHA-PBKDF2 人机验证本地可解（0.5s）；单连接限速 30KB/s，多连接实测 8 路 1.4MB/s |
 
 > **「需登录」是什么意思**：脚本在你已经登录的网盘页面里运行，用同源请求自动带上浏览器里的登录 Cookie —— 你不需要在弹出的面板里再输一次账号，也不会有任何账号信息离开你的浏览器。没登录时脚本会直接告诉你「请先在 xxx 登录」，不会假装成功。
@@ -491,7 +497,7 @@ v1.9.1 起球可以**按住拖动**，松手自动吸附到左边或右边，位
 新版挂载时会清掉页面上多余的实例，但脚本管理器里的那份要自己去删。
 
 **为什么网盘首页没有悬浮球了？**
-v1.9.0 起只在分享页注入（`/s/…`、`/t/…`、`/f/…`），会员页不再运行。v1.10.0 放开 123 云盘个人盘，v1.11.0 放开迅雷个人盘（并把登录页从排除项里拿掉，未登录时也能看到球和提示）；其余平台的个人盘仍然不接管——要解析分享链接，直接打开分享页即可。
+v1.9.0 起只在分享页注入（`/s/…`、`/t/…`、`/f/…`），会员页不再运行。v1.10.0 放开 123 个人盘，v1.11.0 放开迅雷个人盘（并把登录页从排除项里拿掉，未登录也能看到球和提示），v1.12.0 放开百度个人盘；其余平台的个人盘仍然不接管——要解析分享链接，直接打开分享页即可。
 
 **检查更新报「拉取失败 / 网络不通」？**
 v1.9.3 起会自动按 `raw → ghproxy.net → ghfast.top → jsDelivr` 依次重试，四个全挂才会报错，报错里会带上每个源各自的原因。
