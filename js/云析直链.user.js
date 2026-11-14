@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         云析直链 · 网盘直链下载助手
 // @namespace    https://github.com/CYQawa/YunX
-// @version      1.10.0
+// @version      1.11.0
 // @author       云析直链（YunX 移植）
 // @description  夸克 / UC / 123 / 115 / 天翼 / 移动 / 百度 / 迅雷 / 阿里 / 城通 网盘分享直链解析，附分享页去广告：自动列目录、8 线程分片下载、暂停续传，可导出 IDM / Aria2 / cURL 命令。无口令、无授权码，装上即用。
 // @license      AGPL-3.0-or-later
@@ -30,14 +30,13 @@
 // @match        https://pan.baidu.com/share/*
 // @match        https://yun.baidu.com/s/*
 // @match        https://openapi.baidu.com/oauth/*
-// @match        https://pan.xunlei.com/s/*
+// @match        https://pan.xunlei.com/*
 // @match        https://*.ctfile.com/*
 // @match        https://*.ctfile.net/*
 // @match        https://*.545c.com/*
 // @match        https://www.alipan.com/s/*
 // @match        https://www.aliyundrive.com/s/*
 // @exclude      *://*/passport/*
-// @exclude      *://*/login*
 // @exclude      *://*/register*
 // @exclude      *://*/reg.html*
 // @exclude      *://*/vip*
@@ -91,7 +90,7 @@
    * 0. 常量
    * ===================================================================== */
 
-  const APP = { name: '云析直链', version: '1.10.0' };
+  const APP = { name: '云析直链', version: '1.11.0' };
 
   // 夸克 PC 客户端 UA：列表 / 取链接口都校验它
   const UA_QUARK =
@@ -2238,6 +2237,129 @@
       return { id: m[1], pwd };
     },
 
+    /* ---- 个人网盘（登录后的 pan.xunlei.com） ----
+     * 分享页走 /drive/v1/share*，个人盘走 /drive/v1/files*，同一套 api-pan 域名、
+     * 同一套 captcha 签名（action = METHOD:path）。凭据是网页版登录后写在
+     * localStorage 的 credentials_<client_id>.access_token，脚本只读不另存。
+     */
+    pickMine(url) {
+      let u;
+      try { u = new URL(url); } catch (e) { return null; }
+      if (!/(^|\.)xunlei\.com$/.test(u.hostname)) return null;
+      if (u.hostname !== 'pan.xunlei.com') return null;
+      if (this.pick(url)) return null;      // /s/xxx 是分享页，走分享链路
+      if (/^\/s\//.test(u.pathname)) return null;
+      return { mine: true };
+    },
+
+    mineToken() {
+      return xlAccessToken();
+    },
+
+    mineHeaders(ctx, tk) {
+      const h = {
+        'X-Device-Id': XL_DEV,
+        'X-Client-Id': XL_CID,
+        'Origin': 'https://pan.xunlei.com',
+        'Referer': 'https://pan.xunlei.com/',
+        'Authorization': `Bearer ${ctx.token}`
+      };
+      if (tk) h['X-Captcha-Token'] = tk;
+      return h;
+    },
+
+    mineFail(json) {
+      const err = json && json.error;
+      if (err === 'unauthenticated') {
+        return new Error('迅雷登录态已失效：请在 pan.xunlei.com 重新登录，然后刷新页面');
+      }
+      if (err === 'captcha_invalid') {
+        delete xlCaptcha['GET:/drive/v1/files'];
+        return new Error('迅雷验证码失效，点刷新重试一次即可');
+      }
+      const msg = (json && (json.error_description || json.error)) || '未知错误';
+      return new Error(`迅雷返回：${msg}`);
+    },
+
+    async mineInit(ctx) {
+      ctx.mine = true;
+      ctx.token = this.mineToken();
+      if (!ctx.token) {
+        throw new Error('读不到登录令牌：请先在 pan.xunlei.com 登录，登录完成后刷新页面（令牌在 localStorage，换浏览器 / 无痕窗口要重登）');
+      }
+      ctx.title = '我的迅雷云盘';
+      ctx.logged = true;
+    },
+
+    async mineList(ctx, dirId) {
+      const out = [];
+      const seen = new Set();
+      let pageToken = '';
+      const parent = String(dirId == null ? '' : dirId);
+      for (let guard = 0; guard < 50; guard++) {
+        const tk = await xlToken('GET:/drive/v1/files');
+        const qs = new URLSearchParams({
+          parent_id: parent === '0' ? '' : parent,
+          page_token: pageToken,
+          limit: '100',
+          filters: JSON.stringify({ trashed: { eq: false } }),
+          with_audit: 'true',
+          thumbnail_size: 'SIZE_SMALL'
+        });
+        const res = await gmRequest({
+          url: `https://api-pan.xunlei.com/drive/v1/files?${qs.toString()}`,
+          headers: this.mineHeaders(ctx, tk)
+        });
+        const j = parseJSON(res, '读取迅雷云盘目录失败');
+        if (j && j.error) {
+          if (j.error === 'unauthenticated') { ctx.logged = false; ctx.authFailed = true; }
+          throw this.mineFail(j);
+        }
+        const data = j.data || j;
+        const arr = data.files || [];
+        for (const f of arr) {
+          const fid = String(f.id || '');
+          if (!fid || seen.has(fid)) continue;
+          seen.add(fid);
+          out.push({
+            fid,
+            name: f.name || '未命名',
+            size: Number(f.size || 0),
+            dir: f.kind === 'drive#folder',
+            token: ''
+          });
+        }
+        pageToken = String(data.next_page_token || '');
+        if (!pageToken || !arr.length) break;
+        await sleep(80);
+      }
+      return out;
+    },
+
+    async mineLink(ctx, file) {
+      const tk = await xlToken(`GET:/drive/v1/files/${file.fid}`);
+      const res = await gmRequest({
+        url: `https://api-pan.xunlei.com/drive/v1/files/${encodeURIComponent(file.fid)}` +
+          '?_magic=2021&usage=PLAY&thumbnail_size=SIZE_LARGE&with=hdr10&with=subtitle_files',
+        headers: this.mineHeaders(ctx, tk)
+      });
+      const j = parseJSON(res, '获取迅雷直链失败');
+      if (j && j.error) {
+        if (j.error === 'unauthenticated') { ctx.logged = false; ctx.authFailed = true; }
+        throw this.mineFail(j);
+      }
+      const d = j.data || j;
+      const url = ((d.links || {})['application/octet-stream'] || {}).url || d.web_content_link || '';
+      if (!url) throw new Error('迅雷没返回直链，可能是当日流量用完或触发了风控');
+      return {
+        url,
+        headers: { 'User-Agent': XL_UA, 'Referer': 'https://pan.xunlei.com/' },
+        guest: false,
+        filename: file.name,
+        size: Number(d.size || file.size || 0)
+      };
+    },
+
     _h(tk, ctx) {
       const h = {
         'User-Agent': XL_UA,
@@ -2258,6 +2380,7 @@
     },
 
     async list(ctx, dirId) {
+      if (ctx && ctx.mine) return this.mineList(ctx, dirId);
       const sub = !!dirId && dirId !== '0';
       const action = sub ? 'GET:/drive/v1/share/detail' : 'GET:/drive/v1/share';
       const tk = await xlToken(action);
@@ -2296,6 +2419,7 @@
     },
 
     async link(ctx, file) {
+      if (ctx && ctx.mine) return this.mineLink(ctx, file);
       if (!ctx.token) throw new Error('迅雷取链需要登录：请先在 pan.xunlei.com 登录账号');
       const tk = await xlToken('POST:/drive/v1/share/restore');
       const res = await gmRequest({
@@ -2809,21 +2933,27 @@
     }
   }
 
-  // 123 个人盘诊断：登录态 / 根目录 / 首个文件取链，一步步打印，出了问题直接把输出发我
-  async function diagnose123() {
-    const p = PLATFORMS.find((x) => x && x.id === 'pan123');
-    if (!p) return;
-    const ctx = { mine: true, base: 'https://yun.123pan.cn', token: p.mineToken() };
+  // 个人盘诊断：登录态 / 根目录 / 首个文件取链，一步步打印，出了问题直接把输出发我
+  // 123 与迅雷共用（两家的接口完全不同，但流程一样）
+  async function diagnoseMine() {
+    const p = state.platform && state.platform.pickMine
+      ? state.platform
+      : PLATFORMS.find((x) => x && x.pickMine && x.pickMine(location.href));
+    if (!p || !p.pickMine) {
+      toastRootPush('当前页面不是已支持的个人网盘（目前有 123 云盘、迅雷云盘）', 'warn', 4500);
+      return;
+    }
+    const ctx = { mine: true, id: '', pwd: '', title: '', logged: false };
     const lines = [
       `页面：${location.hostname}${location.pathname}`,
-      `令牌：${ctx.token ? ctx.token.slice(0, 14) + '…（共 ' + ctx.token.length + ' 字符）' : 'localStorage 里没读到'}`
+      `平台：${p.name}`
     ];
     try {
-      if (!ctx.token) throw new Error('没有令牌，先登录 yun.123pan.cn');
-      const info = await gmRequest({ url: ctx.base + '/api/user/info', headers: p.mineHeaders(ctx) });
-      const j = parseJSON(info, 'user/info');
-      lines.push(`user/info：code=${j.code}，昵称=${(j.data && (j.data.Nickname || j.data.nickname)) || '-'}`);
-      if (Number(j.code) !== 0) throw new Error(`登录态被拒：${p.mineError(j)}`);
+      if (p.id === 'pan123') ctx.base = 'https://yun.123pan.cn';
+      ctx.token = p.mineToken ? p.mineToken() : '';
+      lines.push(`令牌：${ctx.token ? ctx.token.slice(0, 14) + '…（共 ' + ctx.token.length + ' 字符）' : 'localStorage 里没读到'}`);
+      if (!ctx.token) throw new Error(`没有令牌，先在 ${p.hosts[0]} 完成登录`);
+      await p.mineInit(ctx);
       const list = await p.mineList(ctx, '0');
       lines.push(`根目录：${list.length} 项 → ${list.slice(0, 5).map((i) => i.name).join(' / ') || '空'}`);
       const f = list.find((i) => !i.dir);
@@ -2840,7 +2970,7 @@
       lines.push(`失败：${e.message}`);
     }
     const text = lines.join('\n');
-    console.log('[云析直链] 123 个人盘诊断\n' + text);
+    console.log('[云析直链] 个人盘诊断\n' + text);
     try { copyText(text); } catch (e) { /* ignore */ }
     toastRootPush('诊断结果已复制，并打印在控制台（F12 → Console）', 'info', 5000);
   }
@@ -4109,13 +4239,21 @@
 
   function hookMineDir() {
     try {
-      if (!/123pan\.(cn|com)$/.test(location.hostname)) return;
+      const host = location.hostname;
+      const is123 = /(^|\.)(123pan\.(cn|com)|123865\.com)$/.test(host);
+      const isXL = /(^|\.)xunlei\.com$/.test(host);
+      if (!is123 && !isXL) return;
       const w = (typeof unsafeWindow !== 'undefined' && unsafeWindow) || window;
       if (!w || w.__yxMineHooked) return;
       w.__yxMineHooked = 1;
       const grab = (u) => {
-        const m = String(u || '').match(/[?&]parentFileId=(\d+)/);
-        if (m && m[1]) pageMineDir = m[1];
+        const s = String(u || '');
+        const m123 = s.match(/[?&]parentFileId=(\d+)/);
+        if (m123) { pageMineDir = m123[1]; return; }
+        if (isXL && /\/drive\/v1\/files(\?|$)/.test(s)) {
+          const mx = s.match(/[?&]parent_id=([A-Za-z0-9_-]*)/);
+          if (mx) pageMineDir = mx[1] || '';   // 空串 = 页面回到了根目录
+        }
       };
       if (typeof w.fetch === 'function') {
         const of = w.fetch;
@@ -4753,7 +4891,9 @@
       tag.style.display = '';
       const tok = state.platform && state.platform.id === 'baidu' && state.platform.hasToken && state.platform.hasToken();
       const nick = state.ctx.nick ? String(state.ctx.nick).trim().slice(0, 10) : '';
-      tag.textContent = tok ? '已授权' : (state.ctx.logged ? (nick || '已登录') : (state.platform.guestLabel || '游客'));
+      tag.textContent = tok ? '已授权'
+        : (state.ctx.logged ? (nick || '已登录')
+          : (state.ctx.authFailed ? '登录失效' : (state.platform.guestLabel || '游客')));
       tag.className = 'tag' + (tok || state.ctx.logged ? '' : ' guest');
     } else {
       tag.style.display = 'none';
@@ -5394,7 +5534,7 @@
       if (typeof GM_registerMenuCommand === 'function') {
         GM_registerMenuCommand('⚡ 打开直链面板', () => openPanel());
         GM_registerMenuCommand('⚙ 云析直链设置', () => { state.settingsOpen = true; openPanel(); render(); });
-        GM_registerMenuCommand('🔍 诊断 123 个人盘', () => { diagnose123(); });
+        GM_registerMenuCommand('🔍 诊断当前网盘', () => { diagnoseMine(); });
       }
     } catch (e) { /* ignore */ }
 
