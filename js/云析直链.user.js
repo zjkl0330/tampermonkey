@@ -5255,9 +5255,9 @@
   //   jsDelivr   —— 最后兜底；分支引用最长缓存 12 小时，版本可能滞后
   // 反代只用来读版本号，安装仍走 @updateURL / @downloadURL 的原始地址。
   const UPDATE_SOURCES = [
-    { name: 'GitHub raw', url: RAW_URL, bust: true, timeout: 6000 },
-    { name: 'ghproxy.net', url: 'https://ghproxy.net/' + RAW_URL, bust: false, timeout: 8000 },
-    { name: 'ghfast.top', url: 'https://ghfast.top/' + RAW_URL, bust: false, timeout: 8000 },
+    { name: 'GitHub raw', url: RAW_URL, bust: true, timeout: 6000, fresh: true },
+    { name: 'ghfast.top', url: 'https://ghfast.top/' + RAW_URL, bust: true, timeout: 8000 },
+    { name: 'ghproxy.net', url: 'https://ghproxy.net/' + RAW_URL, bust: true, timeout: 8000 },
     {
       name: 'jsDelivr',
       url: 'https://cdn.jsdelivr.net/gh/zjkl0330/tampermonkey@main/js/%E4%BA%91%E6%9E%90%E7%9B%B4%E9%93%BE.user.js',
@@ -5286,6 +5286,7 @@
     // 只要脚本头 2KB：Range 是 CORS 安全请求头，不用预检；
     // 整包 20 万字节在部分手机浏览器里读 body 会卡住，取头又准又快
     const errs = [];
+    let best = null;
     for (const src of UPDATE_SOURCES) {
       try {
         if (typeof onTry === 'function') onTry(src);
@@ -5302,11 +5303,16 @@
         const text = String((res && res.responseText) || '').slice(0, 4096);
         const m = text.match(/@version\s+([0-9][0-9.]*)/);
         if (!m) throw new Error('脚本头里没有 @version');
-        return { version: m[1], source: src.name, lag: !!src.lag };
+        const got = { version: m[1], source: src.name, lag: !!src.lag };
+        if (!best || cmpVersion(got.version, best.version) > 0) best = got;
+        // 有新版就没必要再问别的源；官方源（不缓存）说「没有新版」也可以收工。
+        // 反代/`CDN 可能自己缓存着旧文件，它说「没有新版」不算数，得再问下一个。
+        if (cmpVersion(got.version, APP.version) > 0 || src.fresh) return got;
       } catch (e) {
         errs.push(`${src.name}: ${e.message || e}`);
       }
     }
+    if (best) return best;
     throw new Error(errs.join(' / '));
   }
 
