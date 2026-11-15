@@ -85,7 +85,7 @@ async def main():
 
         box = await pg.evaluate("""() => {
           const sr = document.getElementById('yunx-panlink-host').shadowRoot;
-          const el = sr.querySelector('input[type=checkbox][data-fid]');
+          const el = sr.querySelector('input[type=checkbox][data-fid]:not([disabled])');
           const r = el.getBoundingClientRect();
           return {x: r.left + r.width/2, y: r.top + r.height/2};
         }""")

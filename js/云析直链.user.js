@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         云析直链 · 网盘直链下载助手
 // @namespace    https://github.com/CYQawa/YunX
-// @version      1.14.0
+// @version      1.15.0
 // @author       云析直链（YunX 移植）
 // @description  夸克 / UC / 123 / 115 / 天翼 / 移动 / 百度 / 迅雷 / 阿里 / 城通 网盘分享直链解析，附分享页去广告：自动列目录、8 线程分片下载、暂停续传，可导出 IDM / Aria2 / cURL 命令。无口令、无授权码，装上即用。
 // @license      AGPL-3.0-or-later
@@ -93,7 +93,7 @@
    * 0. 常量
    * ===================================================================== */
 
-  const APP = { name: '云析直链', version: '1.14.0' };
+  const APP = { name: '云析直链', version: '1.15.0' };
 
   // 夸克 PC 客户端 UA：列表 / 取链接口都校验它
   const UA_QUARK =
@@ -146,6 +146,20 @@
   const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  /* 各家返回的时间格式五花八门：unix 秒、unix 毫秒、"2026-11-14 23:00:00"、ISO 串。
+   * 统一成毫秒时间戳给排序用；解析不出来就 0（排到最后），不要让它污染列表。 */
+  function toMs(v) {
+    if (!v) return 0;
+    if (typeof v === 'number') return v > 1e12 ? v : v * 1000;
+    const str = String(v).trim();
+    if (/^\d+$/.test(str)) {
+      const n = Number(str);
+      return n > 1e12 ? n : n * 1000;
+    }
+    const t = Date.parse(str.replace(' ', 'T'));
+    return Number.isNaN(t) ? 0 : t;
+  }
 
   const esc = (s) =>
     String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
@@ -800,6 +814,7 @@
             name: it.file_name || '未命名',
             size: Number(it.size || 0),
             dir: !!it.dir,
+            mtime: toMs(it.updated_at),
             token: ''
           });
         }
@@ -986,6 +1001,7 @@
             name: it.file_name || '未命名',
             size: Number(it.size || 0),
             dir: !!it.dir,
+            mtime: toMs(it.updated_at),
             token: ''
           });
         }
@@ -1260,6 +1276,7 @@
             name: it.FileName || '未命名',
             size: Number(it.Size || 0),
             dir: Number(it.Type) === 1,
+            mtime: toMs(it.UpdateAt),
             token: `${it.S3KeyFlag || ''}|${it.Etag || ''}|0`
           });
         }
@@ -1947,6 +1964,7 @@
             name: it.server_filename || '未命名',
             size: Number(it.size || 0),
             dir: isDir,
+            mtime: toMs(it.server_mtime),
             token: String(it.path || '')
           });
         }
@@ -2719,6 +2737,7 @@
             name: f.name || '未命名',
             size: Number(f.size || 0),
             dir: f.kind === 'drive#folder',
+            mtime: toMs(f.modified_time),
             token: ''
           });
         }
@@ -3201,6 +3220,8 @@
             name: it.name || '未命名',
             size: Number(it.size || 0),
             dir: isDir,
+            // 城通的时间字段名没在文档里固定过，多试几个；取不到就 0，不影响排序可用性
+            mtime: toMs(it.mtime || it.updated_at || it.modified || it.create_time),
             token: String(it.userid || it.uid || '')
           });
         }
@@ -3391,7 +3412,8 @@
     selFromPage: false, // 当前选中是否来自页面勾选同步
     pageSelDirty: false, // 用户在面板里手动改过选择，别再被页面同步覆盖
     more: null,         // {fid, x, y}
-    settingsOpen: false
+    settingsOpen: false,
+    sort: { key: 'name', dir: 1 }   // 本地排序：name / size / mtime，dir 1 升序 -1 降序
   };
 
   function resetShare() {
@@ -4395,7 +4417,8 @@
     renderStatus();
   }
 
-  async function copySelected() {    const targets = state.items.filter((i) => !i.dir && state.selected.has(i.fid));
+  async function copySelected() {
+    const targets = state.items.filter((i) => !i.dir && state.selected.has(i.fid));
     if (!targets.length) {
       toastRootPush('请先勾选要复制的文件', 'warn');
       return;
@@ -4415,24 +4438,27 @@
     toastRootPush(ok ? `已复制 ${targets.length} 条` : '复制失败', ok ? 'ok' : 'err');
   }
 
-  /* 批量下载：把勾选的文件依次推进下载队列。
-   * 取链一条一条来（间隔 600ms，避免触发频控），但下载本身不排队等完成——
-   * 已启动的任务交给 DL 自己调度，多任务时它会自动平分线程，不会一口气铺满连接。
-   * 浏览器直下模式（手机 / 无 GM 环境）必须一个一个触发，否则会被当成弹窗拦掉。
-   */
-  let batchRunning = false;
   async function downloadSelected() {
     const targets = state.items.filter((i) => !i.dir && state.selected.has(i.fid));
     if (!targets.length) {
-      toastRootPush('请先勾选要下载的文件（文件夹请先点进去）', 'warn');
+      toastRootPush('请先勾选要下载的文件（文件夹请点右边的「全下」）', 'warn');
       return;
     }
-    if (batchRunning) {
-      toastRootPush('上一批还在启动中，稍等一下', 'warn');
-      return;
-    }
-    if (targets.length > 20) {
-      toastRootPush(`一次最多 20 个（当前勾了 ${targets.length} 个），更多的请用「导出 Aria2」`, 'warn', 5000);
+    return enqueueFiles(targets, 20);
+  }
+
+  let batchRunning = false;
+
+  /* 把一批文件依次推进下载队列。
+   * 取链一条一条来（600ms / 浏览器模式 900ms），避免触发频控；
+   * 下载本身不排队等完成——已启动的任务交给 DL 自己调度，多任务时它会平分线程。
+   * 浏览器直下模式必须一个一个触发，否则并发弹窗会被整片拦掉。
+   */
+  async function enqueueFiles(targets, max) {
+    if (!targets.length) { toastRootPush('没有可下载的文件', 'warn'); return; }
+    if (batchRunning) { toastRootPush('上一批还在启动中，稍等一下', 'warn'); return; }
+    if (max && targets.length > max) {
+      toastRootPush(`一次最多 ${max} 个（当前 ${targets.length} 个），更多的请用「导出 Aria2」`, 'warn', 5000);
       return;
     }
     const browserMode = settings.downloadMode === 'browser'
@@ -4442,7 +4468,8 @@
     let ok = 0;
     let fail = 0;
     let lastErr = '';
-    for (const it of targets) {
+    for (let i = 0; i < targets.length; i++) {
+      const it = targets[i];
       try {
         await resolveLink(it);
         if (browserMode) await openInTab(it);
@@ -4452,12 +4479,79 @@
         fail++;
         lastErr = e.message || String(e);
       }
+      // 大批量时每 25 个报一次，让人知道没卡住（toast 2.6s 自动消失，不会堆）
+      if (targets.length > 30 && (i + 1) % 25 === 0 && i + 1 < targets.length) {
+        toastRootPush(`已加入 ${i + 1}/${targets.length}…`, 'info', 2200);
+      }
       await sleep(browserMode ? 900 : 600);
     }
     batchRunning = false;
     if (!ok) toastRootPush(`一个都没取到：${lastErr || '未知原因'}`, 'err', 5000);
     else if (fail) toastRootPush(`已加入 ${ok} 个，${fail} 个取链失败：${lastErr}`, 'warn', 5000);
     else toastRootPush(`已加入下载队列 ${ok} 个`, 'ok', 4000);
+  }
+
+  /* 递归展开一个文件夹：BFS 逐层列目录，把里面的文件全收进来。
+   * 目录 id 各平台都是全局唯一的，不用管重名；seen 用来防环（个别平台能构造出环）。
+   * 限深 8 层、限 200 个文件，扫描间隔 120ms——目录树动辄几十层的话
+   * 光扫描就能触发风控，宁可截断并明确告知，也不装作能全部扫完。
+   */
+  const FOLDER_MAX_DEPTH = 8;
+  const FOLDER_MAX_FILES = 200;
+
+  async function walkFolder(root) {
+    const files = [];
+    const seen = new Set([String(root.fid)]);
+    const queue = [{ fid: root.fid, depth: 0 }];
+    let dirs = 0;
+    let truncated = false;
+    scanningFolder = true;
+    try {
+    while (queue.length) {
+      const cur = queue.shift();
+      dirs++;
+      const list = await state.platform.list(state.ctx, cur.fid);
+      for (const it of list) {
+        if (it.dir) {
+          const id = String(it.fid);
+          if (seen.has(id) || cur.depth + 1 > FOLDER_MAX_DEPTH) continue;
+          seen.add(id);
+          queue.push({ fid: it.fid, depth: cur.depth + 1 });
+        } else {
+          files.push(it);
+          if (files.length >= FOLDER_MAX_FILES) { truncated = true; break; }
+        }
+      }
+      if (truncated) break;
+      if (queue.length) await sleep(120);
+    }
+    } finally {
+      scanningFolder = false;
+    }
+    return { files, dirs, truncated };
+  }
+
+  async function downloadFolder(item) {
+    if (!state.ctx) return;
+    if (batchRunning) { toastRootPush('上一批还在启动中，稍等一下', 'warn'); return; }
+    toastRootPush(`正在扫描「${item.name}」…`, 'info', 6000);
+    let res;
+    try {
+      res = await walkFolder(item);
+    } catch (e) {
+      toastRootPush(`扫描失败：${e.message}`, 'err', 6000);
+      return;
+    }
+    if (!res.files.length) {
+      toastRootPush(`「${item.name}」里没有文件（扫了 ${res.dirs} 个目录）`, 'warn', 4500);
+      return;
+    }
+    if (res.truncated) {
+      toastRootPush(`文件超过 ${FOLDER_MAX_FILES} 个，只取前 ${res.files.length} 个`, 'warn', 5000);
+    } else {
+      toastRootPush(`扫到 ${res.dirs} 个目录、${res.files.length} 个文件`, 'ok', 3500);
+    }
+    await enqueueFiles(res.files, FOLDER_MAX_FILES);
   }
 
   async function exportAria2() {
@@ -4566,6 +4660,8 @@
     .btn.primary:hover { filter: brightness(1.05); }
     .btn.ghost { border-style: dashed; }
     .btn[disabled] { opacity: .45; cursor: not-allowed; }
+    /* 排序按钮的「名称 ↑」不能被搜索框挤成「名称 丨」 */
+    #yx-sort { flex: 0 0 auto; white-space: nowrap; }
     .spacer { flex: 1; }
     .search {
       height: 30px; width: 168px; border-radius: 8px; border: 1px solid #e6ebf2; padding: 0 10px;
@@ -4575,8 +4671,9 @@
     /* 窄屏：五个批量按钮占满一行后，搜索框单独一行，别把按钮挤成两截 */
     @media (max-width: 560px) {
       .bar { padding: 10px 12px; gap: 6px; }
-      .bar .search { flex: 1 1 100%; width: auto; }
       .bar .btn { padding: 0 9px; }
+      /* 五个批量按钮占满第一行，排序 + 搜索共享第二行 */
+      .bar .search { flex: 1 1 80px; width: auto; min-width: 60px; }
     }
 
     .crumb { display: flex; align-items: center; gap: 6px; padding: 8px 18px; font-size: 12px; color: #64748b; border-bottom: 1px solid #f1f5f9; }
@@ -4889,6 +4986,9 @@
    * 比「靠页面文件名逐层反推」可靠得多（那套只对夸克/UC 有效）。
    */
   let pageMineDir = '';        // 页面最近一次列目录用的 parentFileId
+  // 递归扫描期间，脚本自己发的列目录请求会被 hook 当成「页面切目录」，
+  // 结果面板被自己的请求带着乱跳。扫的时候直接把跟随关掉。
+  let scanningFolder = false;
 
   function hookMineDir() {
     try {
@@ -4916,6 +5016,7 @@
       if (!w || w.__yxMineHooked) return;
       w.__yxMineHooked = 1;
       const grab = (u) => {
+        if (scanningFolder) return;
         const s = String(u || '');
         // 脚本自己发的 xpan 请求带 access_token，别当成页面导航，否则会自己跟丢自己
         if (/[?&]access_token=/.test(s)) return;
@@ -5046,6 +5147,7 @@
           <button class="btn" id="yx-export">导出 Aria2</button>
           <button class="btn" id="yx-refresh">刷新</button>
           <div class="spacer"></div>
+          <button class="btn" id="yx-sort" title="切换排序：名称 / 大小 / 时间">名称 ↑</button>
           <input class="search" id="yx-search" placeholder="搜索文件…">
         </div>
         <div class="crumb" id="yx-crumb" style="display:none"></div>
@@ -5304,6 +5406,14 @@
     on('yx-select-all', 'click', selectAll);
     on('yx-export', 'click', exportAria2);
 
+    on('yx-sort', 'click', () => {
+      const i = SORT_CYCLE.findIndex((x) => x.key === state.sort.key && x.dir === state.sort.dir);
+      state.sort = SORT_CYCLE[(i + 1) % SORT_CYCLE.length];
+      const b = getRoot() && getRoot().getElementById('yx-sort');
+      if (b) b.textContent = sortLabel();
+      renderList();
+    });
+
     on('yx-search', 'input', (e) => {
       state.filter = e.target.value.trim().toLowerCase();
       renderList();
@@ -5335,6 +5445,7 @@
         if (act === 'copy') return doCopy(item);
         if (act === 'dl') return doDownload(item);
         if (act === 'enter') return enterDir(item);
+        if (act === 'dir-dl') return downloadFolder(item);
         if (act === 'more') return openMore(btn, item);
         return;
       }
@@ -5658,15 +5769,51 @@
     renderStatus();
   }
 
+  /* 排序只在本地做，不往接口塞 sort 参数。
+   * 各家个人盘的排序参数名与取值都没法在无账号的情况下验证（123 是 sortBy/sortDirection、
+   * 夸克是 _sort、百度是 order/desc、迅雷是 order…），猜一个就是「看起来能用、实际静默失效」。
+   * 本地排序对一页 100 项以内的目录完全够，行为也可预测。文件夹永远排在最前面。
+   */
+  const SORT_CYCLE = [
+    { key: 'name', dir: 1 },
+    { key: 'name', dir: -1 },
+    { key: 'size', dir: -1 },
+    { key: 'size', dir: 1 },
+    { key: 'mtime', dir: -1 },
+    { key: 'mtime', dir: 1 }
+  ];
+
+  function sortLabel() {
+    const k = { name: '名称', size: '大小', mtime: '时间' }[state.sort.key] || '名称';
+    return k + (state.sort.dir === 1 ? ' ↑' : ' ↓');
+  }
+
+  function sortItems(arr) {
+    const { key, dir } = state.sort;
+    return arr.slice().sort((a, b) => {
+      if (!!a.dir !== !!b.dir) return a.dir ? -1 : 1;
+      let d = 0;
+      if (key === 'size') d = (Number(a.size) || 0) - (Number(b.size) || 0);
+      else if (key === 'mtime') d = (Number(a.mtime) || 0) - (Number(b.mtime) || 0);
+      else d = String(a.name).localeCompare(String(b.name), 'zh-Hans-CN', { numeric: true });
+      if (d === 0) d = String(a.name).localeCompare(String(b.name), 'zh-Hans-CN', { numeric: true });
+      return d * dir;
+    });
+  }
+
   function visibleItems() {
-    if (!state.filter) return state.items;
-    return state.items.filter((i) => i.name.toLowerCase().includes(state.filter));
+    const base = state.filter
+      ? state.items.filter((i) => i.name.toLowerCase().includes(state.filter))
+      : state.items;
+    return sortItems(base);
   }
 
   function renderList() {
     const root = getRoot();
     if (!root) return;
     const box = root.getElementById('yx-list');
+    const sortBtn = root.getElementById('yx-sort');
+    if (sortBtn) sortBtn.textContent = sortLabel();
 
     if (!state.ctx) {
       box.innerHTML = `
@@ -5750,7 +5897,8 @@
     const dlCls = task && (task.status === 'run' || task.status === 'pause' || task.status === 'err')
       ? 'mini warn' : 'mini';
     const ops = it.dir
-      ? `<button class="mini solid" data-act="enter">进入</button>`
+      ? `<button class="mini solid" data-act="enter">进入</button>
+         <button class="mini" data-act="dir-dl" title="把这层目录连同子目录里的文件全部下载">全下</button>`
       : `<button class="mini solid" data-act="copy" ${busy ? 'disabled' : ''}>复制</button>
          <button class="${dlCls}" data-act="dl" ${busy ? 'disabled' : ''}>${dlTxt}</button>
          <button class="mini" data-act="more" title="更多">⋯</button>`;

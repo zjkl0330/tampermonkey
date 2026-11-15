@@ -25,6 +25,8 @@ CASES = {
     'test_quark_share.py':  ['朋友的夸克分享', '已复制直链'],
     'test_quark_follow.py': ['f3003', '页面所在目录'],
     'test_quark_batch.py':  ['已加入下载队列 2 个', 'down/f1', 'down/f2'],
+    'test_quark_dir_dl.py': ['down/f2', 'down/f3', "'0', 'd1', 'd2'"],
+    'test_quark_sort.py':   ['六种循环回到起点: True', '大小 ↓', '时间 ↓'],
 
     'test_uc_mine.py':      ['测试UC号', '已复制 1 条'],
     'test_uc_share.py':     ['已复制直链', 'transfer_share/detail'],
