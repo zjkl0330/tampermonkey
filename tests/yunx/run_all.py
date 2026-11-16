@@ -27,6 +27,10 @@ CASES = {
     'test_quark_batch.py':  ['已加入下载队列 2 个', 'down/f1', 'down/f2'],
     'test_quark_dir_dl.py': ['down/f2', 'down/f3', "'0', 'd1', 'd2'"],
     'test_quark_sort.py':   ['六种循环回到起点: True', '大小 ↓', '时间 ↓'],
+    'test_batch_scope.py':  ['已选 3（筛选内 1）', '只取了 f1 的链: True', '提示跳过: True'],
+    'test_link_ttl.py':     ['缓存后重取: True', "链接序号: ['1', '1', '2']"],
+    'test_folder_export.py': ['有 mkdir: True', '带目录参数: True', '文件数: 25'],
+    'test_dl_queue.py':     ['并发不超过 3: True', '确实有排队: True'],
 
     'test_uc_mine.py':      ['测试UC号', '已复制 1 条'],
     'test_uc_share.py':     ['已复制直链', 'transfer_share/detail'],

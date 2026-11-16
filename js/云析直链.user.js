@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         云析直链 · 网盘直链下载助手
 // @namespace    https://github.com/CYQawa/YunX
-// @version      1.15.0
+// @version      1.16.0
 // @author       云析直链（YunX 移植）
 // @description  夸克 / UC / 123 / 115 / 天翼 / 移动 / 百度 / 迅雷 / 阿里 / 城通 网盘分享直链解析，附分享页去广告：自动列目录、8 线程分片下载、暂停续传，可导出 IDM / Aria2 / cURL 命令。无口令、无授权码，装上即用。
 // @license      AGPL-3.0-or-later
@@ -93,7 +93,7 @@
    * 0. 常量
    * ===================================================================== */
 
-  const APP = { name: '云析直链', version: '1.15.0' };
+  const APP = { name: '云析直链', version: '1.16.0' };
 
   // 夸克 PC 客户端 UA：列表 / 取链接口都校验它
   const UA_QUARK =
@@ -3416,6 +3416,15 @@
     sort: { key: 'name', dir: 1 }   // 本地排序：name / size / mtime，dir 1 升序 -1 降序
   };
 
+  /* 递归扫描相关状态，集中放这里：
+   * scanningFolder —— 扫描期间关掉「页面目录跟随」（脚本自己的请求会被 hook 当成页面导航）
+   * scanning       —— 同一时间只允许一条扫描，避免连点「全下」把请求翻倍
+   * scanSeq        —— 每次导航自增，旧扫描发现对不上就中止，别在新目录上继续扫旧树
+   */
+  let scanningFolder = false;
+  let scanning = false;
+  let scanSeq = 0;
+
   function resetShare() {
     state.platform = null;
     state.ctx = null;
@@ -3517,6 +3526,7 @@
   // 个人盘刷新：只重读当前所在目录，不动面包屑
   async function reloadMine() {
     if (!state.platform || !state.ctx || !state.ctx.mine) return;
+    scanSeq++;               // 中止还没跑完的目录扫描
     const top = state.stack[state.stack.length - 1] || { id: '0' };
     state.loading = true;
     state.error = '';
@@ -3627,6 +3637,7 @@
 
   async function enterDir(item) {
     if (!state.platform || !state.ctx) return;
+    scanSeq++;               // 中止还没跑完的目录扫描
     state.navLock = true;   // 用户自己在面板里导航了，别再被页面目录拉走
     state.pageSelDirty = false;
     state.loading = true;
@@ -3647,6 +3658,7 @@
 
   async function backDir() {
     if (state.stack.length <= 1) return;
+    scanSeq++;
     state.navLock = true;
     state.pageSelDirty = false;
     state.stack.pop();
@@ -3665,13 +3677,34 @@
     }
   }
 
+  /* 直链是有寿命的：百度 dlink 8 小时、夸克/UC 大约 1 小时、123 更短。
+   * 面板可能挂着几小时不动，缓存永久有效的话，用户点「复制」拿到的是死链，
+   * 而且报错看起来像脚本坏了。所以按 15 分钟过期，过期自动重取。
+   */
+  const LINK_TTL = 15 * 60 * 1000;
+
+  function cachedLink(fid) {
+    const e = state.links.get(fid);
+    if (!e) return null;
+    const ttl = Number(state.platform && state.platform.linkTTL) || LINK_TTL;
+    if (Date.now() - Number(e.at || 0) > ttl) {
+      state.links.delete(fid);
+      return null;
+    }
+    return e.link;
+  }
+
   async function resolveLink(item, force) {
-    if (!force && state.links.has(item.fid)) return state.links.get(item.fid);
+    if (!force) {
+      const hit = cachedLink(item.fid);
+      if (hit) return hit;
+    }
     if (state.busy.has(item.fid)) {
       // 已在取链，等它完成
       for (let i = 0; i < 60; i++) {
         await sleep(200);
-        if (state.links.has(item.fid)) return state.links.get(item.fid);
+        const hit = cachedLink(item.fid);
+        if (hit) return hit;
         if (!state.busy.has(item.fid)) break;
       }
     }
@@ -3679,7 +3712,7 @@
     renderRowState(item.fid);
     try {
       const link = await state.platform.link(state.ctx, item);
-      state.links.set(item.fid, link);
+      state.links.set(item.fid, { link, at: Date.now() });
       return link;
     } finally {
       state.busy.delete(item.fid);
@@ -3687,16 +3720,35 @@
     }
   }
 
-  function buildAria2(link, name) {
-    const hs = Object.entries(link.headers || {})
-      .map(([k, v]) => ` --header="${k}: ${v}"`).join('');
-    return `aria2c -c -x16 -s16 -k1M${hs} -o "${name}" "${link.url}"`;
+  /* shell 双引号里的转义：文件名带 " $ ` \ 时，不转义会把命令拆坏 */
+  function escSh(s) {
+    return String(s == null ? '' : s)
+      .replace(/\\/g, '\\\\')
+      .replace(/"/g, '\\"')
+      .replace(/\$/g, '\\$')
+      .replace(/`/g, '\\`');
   }
 
-  function buildCurl(link, name) {
+  /* name 是文件名；传了 rel（带目录的相对路径）时用 -d/-o 拆开，
+   * 否则 -o "a/b.mp4" 在没有 a/ 目录时会直接失败。 */
+  function buildAria2(link, name, rel) {
+    const hs = Object.entries(link.headers || {})
+      .map(([k, v]) => ` --header="${k}: ${v}"`).join('');
+    const full = String(rel || name || 'file');
+    const i = full.lastIndexOf('/');
+    const out = i > 0
+      ? ` -d "${escSh(full.slice(0, i))}" -o "${escSh(full.slice(i + 1))}"`
+      : ` -o "${escSh(full)}"`;
+    return `aria2c -c -x16 -s16 -k1M${hs}${out} "${link.url}"`;
+  }
+
+  function buildCurl(link, name, rel) {
     const hs = Object.entries(link.headers || {})
       .map(([k, v]) => ` -H "${k}: ${v}"`).join('');
-    return `curl -L -C -${hs} -o "${name}" "${link.url}"`;
+    const full = String(rel || name || 'file');
+    const i = full.lastIndexOf('/');
+    if (i > 0) return `mkdir -p "${escSh(full.slice(0, i))}" && curl -L -C -${hs} -o "${escSh(full)}" "${link.url}"`;
+    return `curl -L -C -${hs} -o "${escSh(full)}" "${link.url}"`;
   }
 
   function buildPayload(link, name) {
@@ -3922,6 +3974,13 @@
     };
   }
 
+  /* 同时运行的分片下载任务上限。每个任务自己还会开 2~8 条连接，
+   * 所以这个数字直接决定总连接数：3 个任务 ≈ 6~24 条，安全区间。
+   */
+  const DL_MAX_RUNNING = 3;
+  // 排队中的 fid（先进先出）。release() 每次只放一个，避免多个等待者同时醒来又一起越过上限。
+  const DL_QUEUE = [];
+
   const DL = {
     tasks: new Map(),
     _dir: null,
@@ -4005,19 +4064,38 @@
       if (this.get(fid)) return null;
 
       const task = {
-        fid, name: item.name || 'download', size: 0, url: '', headers: {},
+        fid, name: item.saveName || item.name || 'download', size: 0, url: '', headers: {},
         status: 'probe', chunks: [], chunkSize: 0, loaded: 0,
         aborters: new Set(), writer: null, handle: null,
-        speed: 0, fails: 0, err: '', pumping: false
+        speed: 0, fails: 0, err: '', pumping: false, queued: false
       };
       this.tasks.set(fid, task);
       renderRowState(fid);
+
+      /* 并发上限：递归下载动辄几十上百个文件，如果每个任务都立刻开连接，
+       * 瞬间就是几百条 —— 浏览器会卡死，平台也会直接风控。
+       * 超出的先排队（这一步在取链之前，连探测请求都不发），前一个跑完自动放行。
+       */
+      /* 超出的先排队（这一步在取链之前，连探测请求都不发），前一个跑完由 release() 放行。
+       * 用显式队列而不是「循环等 activeCount 降下来」：probe 阶段不计入 activeCount，
+       * 多个任务同时 probe 时会一起越过上限（实测出现过 4 个同时跑）。
+       */
+      if (this.liveCount() > DL_MAX_RUNNING) {
+        task.queued = true;
+        DL_QUEUE.push(fid);
+        renderRowState(fid);
+        while (task.queued && task.status === 'probe' && this.tasks.get(fid) === task) {
+          await sleep(300);
+        }
+        if (this.tasks.get(fid) !== task || task.status !== 'probe') return null;
+      }
 
       let link;
       try {
         link = await resolveLink(item);
       } catch (e) {
         this.tasks.delete(fid);
+        this.release();
         renderRowState(fid);
         toastRootPush(e.message || '取链失败', 'err');
         return null;
@@ -4030,6 +4108,7 @@
       const probe = await this.probe(task.url, task.headers);
       if (!probe.ok || !probe.total || probe.total < 0) {
         this.tasks.delete(fid);
+        this.release();
         renderRowState(fid);
         await fallbackDownload(item, link, '这条直链不支持分片（没有 Range）');
         return null;
@@ -4049,6 +4128,7 @@
         task.writer = await task.handle.createWritable({ keepExistingData: true });
       } catch (e) {
         this.tasks.delete(fid);
+        this.release();
         renderRowState(fid);
         await fallbackDownload(item, link, '无法写入本地缓存（浏览器存储配额不足）');
         return null;
@@ -4101,12 +4181,37 @@
       return n;
     },
 
+    /* 「占着槽位」的任务数：探测中 + 下载中，排队的不算。
+     * 用它判断并发，而不是 activeCount（只看 run），否则 probe 阶段不计入，
+     * 多个任务会在探测期一起越过上限。
+     */
+    liveCount() {
+      let n = 0;
+      for (const t of this.tasks.values()) {
+        if (!t.queued && (t.status === 'probe' || t.status === 'run')) n++;
+      }
+      return n;
+    },
+
+    // 有槽位空出来时放行一个排队任务；一次只放一个，剩下的等下一次释放
+    release() {
+      while (DL_QUEUE.length && this.liveCount() < DL_MAX_RUNNING) {
+        const fid = DL_QUEUE.shift();
+        const t = this.tasks.get(fid);
+        if (!t || t.status !== 'probe' || !t.queued) continue;
+        t.queued = false;
+        renderRowState(fid);
+        return;
+      }
+    },
+
     async pump(task) {
       if (task.pumping) return;
       task.pumping = true;
       // 同时下载多个文件时平分连接数，避免一口气铺开几十个连接被风控
       const running = Math.max(1, this.activeCount());
-      const threads = Math.max(2, Math.min(16, Math.floor((Number(settings.threads) || 8) / running)));
+      // 下限用 1：任务多的时候宁可慢，也不能因为「至少 2 条」把总连接数翻倍
+      const threads = Math.max(1, Math.min(16, Math.floor((Number(settings.threads) || 8) / running)));
 
       const worker = async () => {
         while (task.status === 'run') {
@@ -4162,6 +4267,7 @@
       }
 
       updateTaskUI(task);
+      this.release();
       toastRootPush(`下载完成：${task.name}（${fmtSize(task.size)}）`, 'ok');
       this.forget(task.fid);
       setTimeout(() => {
@@ -4178,6 +4284,7 @@
       try { task.writer && (await task.writer.close()); } catch (e) { /* ignore */ }
       task.writer = null;
       updateTaskUI(task);
+      this.release();
       toastRootPush(`下载失败：${task.err || '未知错误'}（已保留进度，可点「继续」重试）`, 'err');
       this.scheduleSave();
     },
@@ -4203,6 +4310,7 @@
         t.writer = null;
       }
       updateTaskUI(t);
+      this.release();
       this.scheduleSave();
       toastRootPush('已暂停，进度已写入本地缓存，点「继续」从断点接着下');
     },
@@ -4253,6 +4361,7 @@
       if (t._tick) clearInterval(t._tick);
       try { t.writer && (await t.writer.close()); } catch (e) { /* ignore */ }
       this.tasks.delete(fid);
+      this.release();
       this.forget(fid);
       await this.removeCache(fid);
       renderRowState(fid);
@@ -4273,6 +4382,7 @@
           lastT = now;
         }
         updateTaskUI(task);
+        touchStatus();
         if (now - (task._saved || 0) > 4000) {
           task._saved = now;
           this.scheduleSave();
@@ -4417,33 +4527,51 @@
     renderStatus();
   }
 
+  /* 批量操作的取数：只取「当前可见且已选」的文件。
+   * 之前全选用可见项、复制/下载却用 state.items，搜索过滤后会把看不见的也一起处理。
+   * 现在统一到可见范围，并把被跳过的数量告诉用户，不做静默行为。
+   */
+  function selectedFiles() {
+    const visible = new Set(visibleItems().filter((i) => !i.dir).map((i) => i.fid));
+    const all = state.items.filter((i) => !i.dir && state.selected.has(i.fid));
+    const targets = all.filter((i) => visible.has(i.fid));
+    return { targets, hidden: all.length - targets.length };
+  }
+
   async function copySelected() {
-    const targets = state.items.filter((i) => !i.dir && state.selected.has(i.fid));
+    const { targets, hidden } = selectedFiles();
     if (!targets.length) {
-      toastRootPush('请先勾选要复制的文件', 'warn');
+      toastRootPush(hidden ? `已选的 ${hidden} 个文件都在搜索范围外，先清空搜索` : '请先勾选要复制的文件', 'warn', 4500);
       return;
     }
+    if (hidden) toastRootPush(`已跳过搜索范围外的 ${hidden} 个已选文件`, 'warn', 4000);
     toastRootPush(`正在获取 ${targets.length} 个文件的直链…`);
     const lines = [];
-    for (const it of targets) {
+    for (let i = 0; i < targets.length; i++) {
+      const it = targets[i];
       try {
         const link = await resolveLink(it);
         lines.push(buildPayload(link, it.name));
-        await sleep(220); // 温柔一点，避免频控
       } catch (e) {
         lines.push(`# ${it.name} 取链失败：${e.message}`);
       }
+      // 一批几十个时每 25 个报一声，20 秒没动静会被当成卡死
+      if (targets.length > 30 && (i + 1) % 25 === 0 && i + 1 < targets.length) {
+        toastRootPush(`已取 ${i + 1}/${targets.length}…`, 'info', 2000);
+      }
+      await sleep(220); // 温柔一点，避免频控
     }
     const ok = copyText(lines.join('\n'));
     toastRootPush(ok ? `已复制 ${targets.length} 条` : '复制失败', ok ? 'ok' : 'err');
   }
 
   async function downloadSelected() {
-    const targets = state.items.filter((i) => !i.dir && state.selected.has(i.fid));
+    const { targets, hidden } = selectedFiles();
     if (!targets.length) {
-      toastRootPush('请先勾选要下载的文件（文件夹请点右边的「全下」）', 'warn');
+      toastRootPush(hidden ? `已选的 ${hidden} 个文件都在搜索范围外，先清空搜索` : '请先勾选要下载的文件（文件夹请点右边的「全下」）', 'warn', 4500);
       return;
     }
+    if (hidden) toastRootPush(`已跳过搜索范围外的 ${hidden} 个已选文件`, 'warn', 4000);
     return enqueueFiles(targets, 20);
   }
 
@@ -4454,15 +4582,31 @@
    * 下载本身不排队等完成——已启动的任务交给 DL 自己调度，多任务时它会平分线程。
    * 浏览器直下模式必须一个一个触发，否则并发弹窗会被整片拦掉。
    */
+  /* 和单文件 doDownload 用同一套判定：迅雷/百度分享页的直链强校验 Cookie 与 UA，
+   * 分片 fetch 带不上这些头，批量下载必须也走浏览器，否则一批全 403。
+   * 百度个人盘拿到 access_token 后可以走 GM 通道，例外。
+   */
+  function browserDownloadMode() {
+    const forceBrowser = !!(state.platform && state.platform.forceBrowser)
+      && !(state.platform.id === 'baidu' && state.platform.hasToken && state.platform.hasToken());
+    return settings.downloadMode === 'browser'
+      || (settings.downloadMode === 'auto' && (IS_MOBILE || !HAS_GM_XHR || forceBrowser));
+  }
+
   async function enqueueFiles(targets, max) {
     if (!targets.length) { toastRootPush('没有可下载的文件', 'warn'); return; }
     if (batchRunning) { toastRootPush('上一批还在启动中，稍等一下', 'warn'); return; }
-    if (max && targets.length > max) {
-      toastRootPush(`一次最多 ${max} 个（当前 ${targets.length} 个），更多的请用「导出 Aria2」`, 'warn', 5000);
+    const browserMode = browserDownloadMode();
+    /* 浏览器直下是「一个一个弹」：上限给到 20 只会让浏览器在第五六个就把后面的全拦掉，
+     * 用户看到的是「点了没反应」。这里按模式分开限流，宁可少给也不给假的成功。
+     */
+    const cap = browserMode ? 5 : (Number(max) || 20);
+    if (targets.length > cap) {
+      toastRootPush(browserMode
+        ? `浏览器直下一次最多 ${cap} 个（连续触发会被拦），${targets.length} 个请改用「始终分片下载」或导出 Aria2`
+        : `一次最多 ${cap} 个（当前 ${targets.length} 个），更多请用「导出 Aria2」整目录导出`, 'warn', 6500);
       return;
     }
-    const browserMode = settings.downloadMode === 'browser'
-      || (settings.downloadMode === 'auto' && (IS_MOBILE || !HAS_GM_XHR));
     batchRunning = true;
     toastRootPush(`正在获取 ${targets.length} 个文件的直链…`, 'info', 4000);
     let ok = 0;
@@ -4499,32 +4643,49 @@
   const FOLDER_MAX_DEPTH = 8;
   const FOLDER_MAX_FILES = 200;
 
-  async function walkFolder(root) {
+  /* 递归扫描的最短间隔与进度节流 */
+  const WALK_GAP = 120;
+  const WALK_BEAT = 4000;
+
+  async function walkFolder(root, token) {
     const files = [];
     const seen = new Set([String(root.fid)]);
-    const queue = [{ fid: root.fid, depth: 0 }];
+    // rel 从文件夹自己的名字开始，导出时才能还原「相册/1.mp4」这一层
+    const queue = [{ fid: root.fid, depth: 0, rel: String(root.name || '') }];
     let dirs = 0;
     let truncated = false;
+    let beat = Date.now();
     scanningFolder = true;
     try {
-    while (queue.length) {
-      const cur = queue.shift();
-      dirs++;
-      const list = await state.platform.list(state.ctx, cur.fid);
-      for (const it of list) {
-        if (it.dir) {
-          const id = String(it.fid);
-          if (seen.has(id) || cur.depth + 1 > FOLDER_MAX_DEPTH) continue;
-          seen.add(id);
-          queue.push({ fid: it.fid, depth: cur.depth + 1 });
-        } else {
-          files.push(it);
-          if (files.length >= FOLDER_MAX_FILES) { truncated = true; break; }
+      while (queue.length) {
+        if (token !== scanSeq) throw new Error('目录已切换，扫描中止');
+        const cur = queue.shift();
+        dirs++;
+        const list = await state.platform.list(state.ctx, cur.fid);
+        for (const it of list) {
+          const rel = cur.rel ? `${cur.rel}/${it.name}` : String(it.name || '');
+          if (it.dir) {
+            const id = String(it.fid);
+            if (seen.has(id) || cur.depth + 1 > FOLDER_MAX_DEPTH) continue;
+            seen.add(id);
+            queue.push({ fid: it.fid, depth: cur.depth + 1, rel });
+          } else {
+            // rel 用来在导出时还原目录结构，避免不同子目录里的同名文件互相覆盖
+            files.push(Object.assign({}, it, {
+              rel,
+              // 浏览器下载不能保留目录，只能在文件名里带上前缀区分同名文件
+              saveName: rel.indexOf('/') >= 0 ? rel.replace(/\//g, '_') : it.name
+            }));
+            if (files.length >= FOLDER_MAX_FILES) { truncated = true; break; }
+          }
+        }
+        if (truncated) break;
+        if (queue.length) await sleep(WALK_GAP);
+        if (Date.now() - beat > WALK_BEAT) {
+          beat = Date.now();
+          toastRootPush(`已扫 ${dirs} 个目录 / ${files.length} 个文件…`, 'info', 2200);
         }
       }
-      if (truncated) break;
-      if (queue.length) await sleep(120);
-    }
     } finally {
       scanningFolder = false;
     }
@@ -4533,14 +4694,18 @@
 
   async function downloadFolder(item) {
     if (!state.ctx) return;
-    if (batchRunning) { toastRootPush('上一批还在启动中，稍等一下', 'warn'); return; }
+    if (scanning || batchRunning) { toastRootPush('上一批还在处理中，稍等一下', 'warn'); return; }
+    scanning = true;
+    const token = ++scanSeq;
     toastRootPush(`正在扫描「${item.name}」…`, 'info', 6000);
     let res;
     try {
-      res = await walkFolder(item);
+      res = await walkFolder(item, token);
     } catch (e) {
       toastRootPush(`扫描失败：${e.message}`, 'err', 6000);
       return;
+    } finally {
+      scanning = false;
     }
     if (!res.files.length) {
       toastRootPush(`「${item.name}」里没有文件（扫了 ${res.dirs} 个目录）`, 'warn', 4500);
@@ -4551,25 +4716,49 @@
     } else {
       toastRootPush(`扫到 ${res.dirs} 个目录、${res.files.length} 个文件`, 'ok', 3500);
     }
-    await enqueueFiles(res.files, FOLDER_MAX_FILES);
-  }
-
-  async function exportAria2() {
-    const targets = state.items.filter((i) => !i.dir);
-    if (!targets.length) {
-      toastRootPush('当前目录没有文件', 'warn');
+    /* 目录树一大，浏览器里排几十个任务既慢又容易被拦。
+     * 分片模式超过 20 个、浏览器直下模式超过 5 个，都直接给 Aria2 清单
+     * （浏览器直下的上限更低：连续触发 fifth 个开始就会被拦）。
+     */
+    const cap = browserDownloadMode() ? 5 : 20;
+    if (res.files.length > cap) {
+      toastRootPush(`文件较多（${res.files.length} 个，浏览器模式上限 ${cap}），已改为导出 Aria2 清单`, 'info', 5000);
+      await exportAria2List(res.files, item.name);
       return;
     }
-    toastRootPush(`正在生成 ${targets.length} 个文件的 Aria2 脚本…`);
-    const lines = ['#!/bin/sh', '# 由云析直链生成', ''];
-    for (const it of targets) {
+    await enqueueFiles(res.files, cap);
+  }
+
+  /* 生成 Aria2 脚本。传了 rel 的文件会先 mkdir -p，保留目录结构。 */
+  async function exportAria2List(files, title) {
+    if (!files.length) {
+      toastRootPush('没有可导出的文件', 'warn');
+      return;
+    }
+    toastRootPush(`正在生成 ${files.length} 个文件的 Aria2 脚本…`);
+    const lines = ['#!/bin/sh', '# 由云析直链生成' + (title ? `：${title}` : ''), ''];
+    const dirs = new Set();
+    files.forEach((f) => {
+      const rel = String(f.rel || '');
+      const i = rel.lastIndexOf('/');
+      if (i > 0) dirs.add(rel.slice(0, i));
+    });
+    if (dirs.size) {
+      Array.from(dirs).forEach((d) => lines.push(`mkdir -p "${escSh(d)}"`));
+      lines.push('');
+    }
+    for (let i = 0; i < files.length; i++) {
+      const it = files[i];
       try {
         const link = await resolveLink(it);
-        lines.push(buildAria2(link, it.name));
-        await sleep(220);
+        lines.push(buildAria2(link, it.name, it.rel));
       } catch (e) {
-        lines.push(`# ${it.name}：${e.message}`);
+        lines.push(`# ${it.rel || it.name}：${e.message}`);
       }
+      if (files.length > 30 && (i + 1) % 25 === 0 && i + 1 < files.length) {
+        toastRootPush(`已取 ${i + 1}/${files.length} 条直链…`, 'info', 2000);
+      }
+      await sleep(220);
     }
     const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
     const a = document.createElement('a');
@@ -4579,6 +4768,16 @@
     a.click();
     setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 8000);
     toastRootPush('已导出 Aria2 脚本', 'ok');
+  }
+
+  async function exportAria2() {
+    // 导出「当前可见的整个目录」，搜索时只导筛出来的那些
+    const targets = visibleItems().filter((i) => !i.dir);
+    if (!targets.length) {
+      toastRootPush('当前目录没有文件', 'warn');
+      return;
+    }
+    await exportAria2List(targets, state.ctx && state.ctx.title);
   }
 
   /* =======================================================================
@@ -4740,6 +4939,8 @@
     .inputbar input:focus { border-color: var(--acc, #1e6fff); }
 
     .ft { padding: 9px 18px; border-top: 1px solid #eef2f7; display: flex; align-items: center; gap: 10px; font-size: 12px; color: #94a3b8; }
+    /* 状态栏文字变长（带下载进度）后要能省略，不能把面板顶宽 */
+    .ft #yx-status { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
     .ft .dot { width: 6px; height: 6px; border-radius: 50%; background: #22c55e; }
     .ft .dot.guest { background: #f59e0b; }
 
@@ -4986,9 +5187,6 @@
    * 比「靠页面文件名逐层反推」可靠得多（那套只对夸克/UC 有效）。
    */
   let pageMineDir = '';        // 页面最近一次列目录用的 parentFileId
-  // 递归扫描期间，脚本自己发的列目录请求会被 hook 当成「页面切目录」，
-  // 结果面板被自己的请求带着乱跳。扫的时候直接把跟随关掉。
-  let scanningFolder = false;
 
   function hookMineDir() {
     try {
@@ -5417,6 +5615,7 @@
     on('yx-search', 'input', (e) => {
       state.filter = e.target.value.trim().toLowerCase();
       renderList();
+      renderStatus();   // 状态栏要跟着报「筛选内几个已选」，否则「已选 12」配 2 行列表会让人以为错乱
     });
 
     // 列表事件委托
@@ -5892,15 +6091,20 @@
     const busy = state.busy.has(it.fid);
     const task = it.dir ? null : DL.get(it.fid);
     const dlTxt = !task ? '下载'
-      : task.status === 'run' ? '暂停'
-        : (task.status === 'pause' || task.status === 'err') ? '继续' : '下载';
+      : task.queued ? '排队'
+        : task.status === 'run' ? '暂停'
+          : (task.status === 'pause' || task.status === 'err') ? '继续' : '下载';
     const dlCls = task && (task.status === 'run' || task.status === 'pause' || task.status === 'err')
       ? 'mini warn' : 'mini';
+    /* 「全下」只在个人盘出现：分享页取链依赖分享上下文（stoken / fids_token），
+     * 递归到子目录后是否还成立没法在没有真实账号的情况下确认，不拿不确定的东西糊上去。
+     * 分享页仍然可以进目录 → 全选 → 下载已选。
+     */
     const ops = it.dir
-      ? `<button class="mini solid" data-act="enter">进入</button>
-         <button class="mini" data-act="dir-dl" title="把这层目录连同子目录里的文件全部下载">全下</button>`
+      ? `<button class="mini solid" data-act="enter">进入</button>${state.mine
+        ? `\n         <button class="mini" data-act="dir-dl" title="把这层目录连同子目录里的文件全部下载">全下</button>` : ''}`
       : `<button class="mini solid" data-act="copy" ${busy ? 'disabled' : ''}>复制</button>
-         <button class="${dlCls}" data-act="dl" ${busy ? 'disabled' : ''}>${dlTxt}</button>
+         <button class="${dlCls}" data-act="dl" ${busy || (task && task.queued) ? 'disabled' : ''}>${dlTxt}</button>
          <button class="mini" data-act="more" title="更多">⋯</button>`;
     const stateTxt = busy ? '<span class="state">取链中…</span>' : '<span class="state" data-state></span>';
 
@@ -5945,6 +6149,17 @@
     if (bar) bar.style.width = pct + '%';
   }
 
+  /* 下载进度写进状态栏时会每 500ms 触发一次（每个任务一个 ticker），
+   * 批量下载时几十个任务一起刷会把主线程拖住，这里统一节流到 900ms 一次。
+   */
+  let _statusAt = 0;
+  function touchStatus() {
+    const now = Date.now();
+    if (now - _statusAt < 900) return;
+    _statusAt = now;
+    renderStatus();
+  }
+
   function renderStatus() {
     const root = getRoot();
     if (!root) return;
@@ -5963,7 +6178,21 @@
     const tok = state.platform.id === 'baidu' && state.platform.hasToken && state.platform.hasToken();
     const mode = tok ? '令牌已授权' : (state.ctx.logged ? '登录态' : (state.platform.guestLabel || '游客态'));
     const count = dirs ? `${total} 文件 / ${dirs} 文件夹` : `${total} 个文件`;
-    el.textContent = `${state.platform.name} · 共 ${count} · 已选 ${sel} · ${mode}`;
+    // 搜索时把「可见几个」也报出来：否则「已选 12」配着 2 行列表，用户会以为脚本错乱
+    let selTxt = `已选 ${sel}`;
+    if (state.filter) {
+      const vis = visibleItems().filter((i) => !i.dir && state.selected.has(i.fid)).length;
+      selTxt = `已选 ${sel}（筛选内 ${vis}）`;
+    }
+    // 递归下载的文件不在当前列表里，行内进度看不到，把总体进度放进状态栏
+    const tasks = Array.from(DL.tasks.values());
+    let dlStat = '';
+    if (tasks.length) {
+      const done = tasks.filter((t) => t.status === 'done').length;
+      const wait = tasks.filter((t) => t.queued).length;
+      dlStat = `⬇ ${done}/${tasks.length}${wait ? ` 排队 ${wait}` : ''} · `;
+    }
+    el.textContent = `${state.platform.name} · ${dlStat}共 ${count} · ${selTxt} · ${mode}`;
     dot.className = 'dot' + (state.ctx.logged || tok ? '' : ' guest');
 
     const allBtn = root.getElementById('yx-select-all');
